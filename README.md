@@ -23,3 +23,9 @@ While the MVP successfully maps notes to their correct pitch, there are signific
 **Next Steps:**
 1. Custom Model Training: Replace the underlying OMR engine by training or fine-tuning custom models (e.g., YOLO architectures on datasets like DeepScores) to compare accuracy and improve rhythm detection.
 2. Graphical User Interface (GUI): Implement a web-based interface using `Streamlit` to move away from the CLI and allow users to easily upload images and play audio directly in the browser.
+
+**Next Steps / Roadmap:**
+1. **Custom Model Training:** Replace the underlying OMR engine by training or fine-tuning custom state-of-the-art models (e.g., YOLO architectures on datasets like DeepScores) to drastically improve rhythm and beam detection.
+2. **Baseline Engine Comparison:** Preserve the current `oemer` integration in the project structure as a permanent baseline. This will allow for direct, side-by-side A/B testing between the pre-packaged library and the newly trained custom models.
+3. **PDF Processing Optimization:** Resolve the current Docker memory/volume crash (`unexpected EOF`) when parsing and converting high-resolution multi-page PDFs using `poppler`.
+4. **Storage Management:** Safely map the Docker internal `/tmp` directory to a secondary host drive (e.g., `D:`) to prevent the primary OS drive from bloating during heavy AI inference tasks.

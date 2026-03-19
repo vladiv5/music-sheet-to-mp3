@@ -1,6 +1,10 @@
+numpy<2.0.0
 oemer
 music21
 midi2audio
 fastapi
 uvicorn
 streamlit
+onnxruntime-gpu
+scikit-learn==1.2.0
+pdf2image
