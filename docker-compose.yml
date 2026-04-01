@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  omr_app:
+    build: .
+    container_name: music_sheet_to_mp3_app
+    ports:
+      - "8501:8501"
+
+    volumes:
+      - ./temp_ai:/tmp
+      - ./tests/current_test:/app/tests/current_test
+      # --- HOT-RELOADING ---
+      # Mount source files directly so changes saved locally are reflected
+      # inside the container without a full Docker image rebuild.
+      - ./app.py:/app/app.py
+      - ./core:/app/core
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # --- STREAMLIT HOT-RELOAD ---
+      # 'poll' watcher works reliably with Docker volume mounts on Windows (inotify not available).
+      # runOnSave triggers an automatic rerun whenever a mounted .py file is saved.
+      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=poll
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true
+    restart: unless-stopped

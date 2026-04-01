@@ -29,3 +29,16 @@ While the MVP successfully maps notes to their correct pitch, there are signific
 2. **Baseline Engine Comparison:** Preserve the current `oemer` integration in the project structure as a permanent baseline. This will allow for direct, side-by-side A/B testing between the pre-packaged library and the newly trained custom models.
 3. **PDF Processing Optimization:** Resolve the current Docker memory/volume crash (`unexpected EOF`) when parsing and converting high-resolution multi-page PDFs using `poppler`.
 4. **Storage Management:** Safely map the Docker internal `/tmp` directory to a secondary host drive (e.g., `D:`) to prevent the primary OS drive from bloating during heavy AI inference tasks.
+
+## Major Refactoring & Upgrade (2026-04-01)
+
+The project has undergone a significant architectural upgrade to support faster development and experimental AI models:
+
+*   **Hot-Reloading in Docker:** Enabled real-time UI and logic updates. By mounting `app.py` and the `core/` folder as volumes, changes saved locally are instantly reflected in the running Streamlit container without requiring a Docker rebuild.
+*   **AI Engine Dispatcher:** Implemented a selection system in the UI to toggle between the **Oemer Baseline** and the new **Custom CV Model** (YOLO-based skeleton).
+*   **Benchmarking System:** Added a high-precision timer to measure the exact inference time of each AI engine. This "Processing Time" is displayed as a metric in the UI for A/B testing and performance optimization.
+*   **Custom CV Model Skeleton:** Created `models/custom_yolo_inference.py` as a functional mock. It simulates an AI inference pipeline (Do-Re-Mi scale) to validate the integration before plugging in a real YOLO-based model.
+*   **Enhanced UI (Streamlit):**
+    *   Added **MusicXML Parsing** via `music21` to display the extracted note sequence in a collapsible expander.
+    *   Improved visual feedback with specialized metrics and success/info notifications.
+*   **Clean Repository Management:** Updated `.gitignore` to prevent large binary artifacts (WAV/MID) and temporary Docker data from cluttering the repository, while preserving historical tests and inputs.

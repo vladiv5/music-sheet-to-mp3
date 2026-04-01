@@ -15,3 +15,16 @@ env/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Project-specific temporary data
+# I ignore the current test run directory but keep other tests in the tests/ folder
+temp_ai/
+tests/current_test/
+
+# Ignore generated audio/intermediate files in the root or current_test
+# If they are part of a past test (e.g. tests/test1/), we allow them unless they are large.
+# Actually, it's safer to avoid commiting generated media files to Git.
+*.wav
+*.mp3
+*.mid
+# We keep .musicxml and images in tests/ as they are useful for verification/input.

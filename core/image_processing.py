@@ -2,9 +2,9 @@ import os
 import subprocess
 import shutil
 
-def generate_musicxml(image_path: str, output_dir: str = "./") -> str:
+def generation_workflow_oemer(image_path: str, output_dir: str = "./") -> str:
     """
-    I process the music sheet image and generate a MusicXML file.
+    I process the music sheet image and generate a MusicXML file using the Oemer Baseline engine.
     I also force the generation of diagnostic images and move everything to the output directory.
     """
     # I extract the filename without extension to know what the XML will be called
