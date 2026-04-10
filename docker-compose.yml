@@ -6,6 +6,7 @@ services:
     container_name: music_sheet_to_mp3_app
     ports:
       - "8501:8501"
+    shm_size: '4gb'
 
     volumes:
       - ./temp_ai:/tmp

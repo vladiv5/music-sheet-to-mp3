@@ -1,0 +1,12 @@
+train: /app/dataset/minor_dataset/dataset_1/train/images
+val: /app/dataset/minor_dataset/dataset_1/train/images
+
+nc: 7
+names: ['barline', 'clef_f', 'clef_g', 'note_half', 'note_quarter', 'note_whole', 'time_signature']
+
+roboflow:
+  workspace: ziuzs-workspace
+  project: ziuzs-workspace
+  version: dataset
+  license: Private
+  url: https://app.roboflow.com/ziuzs-workspace/ziuzs-workspace/dataset
