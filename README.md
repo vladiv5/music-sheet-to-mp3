@@ -77,3 +77,11 @@ The model's detection quality is **intentionally poor** — this is expected and
 3.  ✅ Establish a repeatable workflow for future iterations with larger, richer datasets.
 
 The next step is to scale the dataset (more images, more diverse annotations) and retrain to meaningfully improve detection accuracy.
+
+## Pitch Detection & Staff Isolation (2026-04-14)
+
+Following the initial YOLO training, the project focus shifted to accurately extracting musical meaning from raw bounding boxes.
+
+*   **Classical CV Staff Detection:** Implemented `core/staff_detector.py`, a pure OpenCV module that detects the horizontal staff grid using morphological operations and row-projection profiles. It uniquely identifies systems of 5 lines and computes spatial measurements (e.g., inter-line pacing).
+*   **Pitch Mapping Strategy:** By isolating the staff framework, YOLO bounding-box Y-coordinates can be mapped natively into precise musical pitches, taking interline spacing and ledger lines into account.
+*   **Blob Extraction Pipeline:** Actively implementing shape-based notehead detection to effectively separate isolated noteheads from stems or overlapping staff lines.

@@ -11,11 +11,15 @@ services:
     volumes:
       - ./temp_ai:/tmp
       - ./tests/current_test:/app/tests/current_test
+      # --- DATASETS ---
+      - ./dataset/big_dataset:/app/dataset/big_dataset
+      - ./dataset/minor_dataset:/app/dataset/minor_dataset
       # --- HOT-RELOADING ---
       # Mount source files directly so changes saved locally are reflected
       # inside the container without a full Docker image rebuild.
       - ./app.py:/app/app.py
       - ./core:/app/core
+      - ./models:/app/models
 
     deploy:
       resources:

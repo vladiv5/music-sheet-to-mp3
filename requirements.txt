@@ -8,3 +8,5 @@ streamlit
 onnxruntime-gpu
 scikit-learn==1.2.0
 pdf2image
+ultralytics
+opencv-python-headless
