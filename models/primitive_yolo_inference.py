@@ -192,11 +192,13 @@ def run_detection_sahi(
     detections = []
     for pred in result.object_prediction_list:
         bbox = pred.bbox
+        b_w = bbox.maxx - bbox.minx
+        b_h = bbox.maxy - bbox.miny
         detections.append(Detection(
             class_name=pred.category.name,
-            x_center=bbox.minx + bbox.width / 2,
-            y_center=bbox.miny + bbox.height / 2,
-            width=bbox.width, height=bbox.height,
+            x_center=bbox.minx + b_w / 2,
+            y_center=bbox.miny + b_h / 2,
+            width=b_w, height=b_h,
             confidence=pred.score.value,
             class_id=pred.category.id,
         ))
