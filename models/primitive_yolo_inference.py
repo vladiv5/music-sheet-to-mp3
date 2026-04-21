@@ -168,14 +168,14 @@ def run_detection_sahi(
 ) -> List[Detection]:
     try:
         from sahi.predict import get_sliced_prediction
-        from sahi.models.yolov8 import Yolov8DetectionModel
+        from sahi.models.ultralytics import UltralyticsDetectionModel
     except ImportError:
         raise ImportError("sahi is not installed")
         
     with open("requirements.txt") as req:
         device = "cuda:0" if "onnxruntime-gpu" in req.read() else "cpu"
         
-    detection_model = Yolov8DetectionModel(
+    detection_model = UltralyticsDetectionModel(
         model_path=MODEL_PATH,
         confidence_threshold=conf,
         device=device,
