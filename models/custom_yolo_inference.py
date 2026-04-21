@@ -143,10 +143,18 @@ class MusicalEvent:
     event_type: str      # 'note', 'rest'
     duration_type: str   # 'quarter', 'half', 'whole', 'eighth', '16th'
     duration_beats: float
-    step: Optional[str] = None    # 'C', 'D', etc.
+    step: Optional[str] = None
     octave: Optional[int] = None
-    alter: Optional[int] = None   # -1 = flat, +1 = sharp
-    x_position: float = 0.0       # for sorting left-to-right
+    alter: Optional[int] = None
+    x_position: float = 0.0
+
+@dataclass
+class ChordEvent:
+    notes: List[MusicalEvent]
+    duration_beats: float
+    duration_type: str
+    is_chord: bool
+
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +202,7 @@ def run_detection(image_path: str, conf: float = 0.25) -> List[Detection]:
         source=image_path,
         imgsz=1280,
         conf=conf,
+        iou=iou,
         verbose=False,
     )
 
@@ -238,6 +247,54 @@ def _get_pitch_map(clef_type: str) -> Dict[int, Tuple[str, int]]:
     if clef_type == 'Bass-clef':
         return BASS_PITCH_MAP
     return TREBLE_PITCH_MAP
+
+
+
+def run_detection_sahi(
+    image_path: str, conf: float = 0.25, iou: float = 0.7,
+    slice_size: int = 640, overlap_ratio: float = 0.25
+) -> List[Detection]:
+    try:
+        from sahi.predict import get_sliced_prediction
+        from sahi.models.yolov8 import Yolov8DetectionModel
+    except ImportError:
+        raise ImportError("sahi is not installed")
+        
+    # Read requirements to dynamically set device
+    with open("requirements.txt") as req:
+        device = "cuda:0" if "onnxruntime-gpu" in req.read() else "cpu"
+        
+    detection_model = Yolov8DetectionModel(
+        model_path=MODEL_PATH,
+        confidence_threshold=conf,
+        device=device,
+    )
+
+    result = get_sliced_prediction(
+        image_path,
+        detection_model,
+        slice_height=slice_size,
+        slice_width=slice_size,
+        overlap_height_ratio=overlap_ratio,
+        overlap_width_ratio=overlap_ratio,
+        postprocess_match_metric="IOU",
+        postprocess_match_threshold=iou,
+    )
+
+    detections = []
+    for pred in result.object_prediction_list:
+        bbox = pred.bbox
+        detections.append(Detection(
+            class_name=pred.category.name,
+            x_center=bbox.minx + bbox.width / 2,
+            y_center=bbox.miny + bbox.height / 2,
+            width=bbox.width,
+            height=bbox.height,
+            confidence=pred.score.value,
+            class_id=pred.category.id,
+        ))
+    detections.sort(key=lambda d: d.x_center)
+    return detections
 
 
 def find_notehead_y(detection: Detection, gray_image: np.ndarray) -> float:
@@ -352,8 +409,10 @@ def _find_accidental_for_note(
 def detections_to_events(
     detections: List[Detection],
     staffs: List[StaffGroup],
-    gray_image: np.ndarray
-) -> List[MusicalEvent]:
+    gray_image: np.ndarray,
+    dx_tolerance: float = 15.0,
+    enable_beam_correction: bool = True
+) -> List[ChordEvent]:
     """
     Convert raw YOLO detections into a sequence of MusicalEvents.
     Groups detections by staff (top-to-bottom) and processes them
@@ -431,14 +490,34 @@ def detections_to_events(
                     x_position=det.x_center,
                 ))
 
-    print(f"[CustomYOLO] 🎵 Generated {len(events)} musical events "
-          f"({sum(1 for e in events if e.event_type == 'note')} notes, "
-          f"{sum(1 for e in events if e.event_type == 'rest')} rests)")
+    # Group into ChordEvents
+    chord_events = []
+    current_chord = []
+    
+    for ev in events:
+        if ev.event_type == 'rest':
+            if current_chord:
+                chord_events.append(ChordEvent(notes=current_chord, duration_beats=current_chord[0].duration_beats, duration_type=current_chord[0].duration_type, is_chord=len(current_chord)>1))
+                current_chord = []
+            chord_events.append(ChordEvent(notes=[ev], duration_beats=ev.duration_beats, duration_type=ev.duration_type, is_chord=False))
+        else:
+            if not current_chord:
+                current_chord.append(ev)
+            else:
+                if abs(ev.x_position - current_chord[0].x_position) <= dx_tolerance:
+                    current_chord.append(ev)
+                else:
+                    chord_events.append(ChordEvent(notes=current_chord, duration_beats=current_chord[0].duration_beats, duration_type=current_chord[0].duration_type, is_chord=len(current_chord)>1))
+                    current_chord = [ev]
+    if current_chord:
+        chord_events.append(ChordEvent(notes=current_chord, duration_beats=current_chord[0].duration_beats, duration_type=current_chord[0].duration_type, is_chord=len(current_chord)>1))
 
-    return events
+    print(f"[CustomYOLO] 🎵 Generated {len(chord_events)} chord events")
+
+    return chord_events
 
 
-def _split_into_measures(events: List[MusicalEvent], beats_per_measure: int = 4) -> List[List[MusicalEvent]]:
+def _split_into_measures(events: List[ChordEvent], beats_per_measure: int = 4) -> List[List[ChordEvent]]:
     """
     Split a flat list of events into measures based on beat count.
     Uses a simple greedy approach: fill each measure up to beats_per_measure.
@@ -467,7 +546,7 @@ def _split_into_measures(events: List[MusicalEvent], beats_per_measure: int = 4)
     return measures
 
 
-def events_to_musicxml(events: List[MusicalEvent], title: str = "Custom YOLO Detection") -> str:
+def events_to_musicxml(events: List[ChordEvent], title: str = "Custom YOLO Detection") -> str:
     """
     Convert a list of MusicalEvents into a MusicXML string.
     """
@@ -517,29 +596,36 @@ def events_to_musicxml(events: List[MusicalEvent], title: str = "Custom YOLO Det
             SubElement(clef, 'sign').text = 'G'
             SubElement(clef, 'line').text = '2'
 
-        for event in measure_events:
+        for chord_event in measure_events:
             note_elem = SubElement(measure, 'note')
 
-            if event.event_type == 'rest':
+            if chord_event.notes[0].event_type == 'rest':
                 SubElement(note_elem, 'rest')
+                SubElement(note_elem, 'duration').text = str(beats_to_duration(chord_event.duration_beats))
+                SubElement(note_elem, 'type').text = chord_event.duration_type
             else:
-                pitch = SubElement(note_elem, 'pitch')
-                SubElement(pitch, 'step').text = event.step
-                if event.alter is not None:
-                    SubElement(pitch, 'alter').text = str(event.alter)
-                SubElement(pitch, 'octave').text = str(event.octave)
+                for note_idx, event in enumerate(chord_event.notes):
+                    if note_idx > 0:
+                        note_elem = SubElement(measure, 'note')
+                        SubElement(note_elem, 'chord')
 
-            SubElement(note_elem, 'duration').text = str(beats_to_duration(event.duration_beats))
-            SubElement(note_elem, 'type').text = event.duration_type
+                    pitch = SubElement(note_elem, 'pitch')
+                    SubElement(pitch, 'step').text = event.step
+                    if event.alter is not None:
+                        SubElement(pitch, 'alter').text = str(event.alter)
+                    SubElement(pitch, 'octave').text = str(event.octave)
 
-            # Add dot for dotted notes
-            if event.duration_type in ('half', 'quarter') and event.duration_beats in (3, 1.5):
-                SubElement(note_elem, 'dot')
+                    SubElement(note_elem, 'duration').text = str(beats_to_duration(chord_event.duration_beats))
+                    SubElement(note_elem, 'type').text = chord_event.duration_type
 
-            # Add accidental element for display
-            if event.alter is not None:
-                acc_elem = SubElement(note_elem, 'accidental')
-                acc_elem.text = 'flat' if event.alter == -1 else 'sharp'
+                    # Add dot for dotted notes
+                    if chord_event.duration_type in ('half', 'quarter') and chord_event.duration_beats in (3, 1.5):
+                        SubElement(note_elem, 'dot')
+
+                    # Add accidental element for display
+                    if event.alter is not None:
+                        acc_elem = SubElement(note_elem, 'accidental')
+                        acc_elem.text = 'flat' if event.alter == -1 else 'sharp'
 
     # If no events at all, add one empty measure with a whole rest
     if not events:
@@ -588,6 +674,7 @@ def save_diagnostic_image(
     image_path: str,
     detections: List[Detection],
     staffs: List[StaffGroup],
+    chord_events: List[ChordEvent],
     output_path: str
 ) -> str:
     """
@@ -595,6 +682,7 @@ def save_diagnostic_image(
       - Bounding boxes with class labels and confidence
       - Staff lines overlaid in blue
       - Color-coded boxes by category (notes=green, rests=orange, clefs=purple)
+      - Chord groupings highlighted with cyan rectangles
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -635,6 +723,16 @@ def save_diagnostic_image(
         cv2.rectangle(img, (x1, y1 - label_size[1] - 6), (x1 + label_size[0], y1), color, -1)
         cv2.putText(img, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
+    # Draw chord groupings (cyan bounding rectangle around chord members)
+    for ce in chord_events:
+        if ce.is_chord:
+            min_x = min(n.x_position for n in ce.notes) - 20
+            max_x = max(n.x_position for n in ce.notes) + 20
+            chord_label = f"CHORD ({len(ce.notes)} notes)"
+            cx = int((min_x + max_x) / 2)
+            cv2.putText(img, chord_label, (int(min_x), 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+
     cv2.imwrite(output_path, img)
     print(f"[CustomYOLO] 🖼️ Diagnostic image saved: {output_path}")
     return output_path
@@ -647,7 +745,13 @@ def save_diagnostic_image(
 def generation_workflow_custom_yolo(
     image_path: str,
     output_dir: str = "./",
-    conf: float = 0.25
+    conf: float = 0.25,
+    iou: float = 0.7,
+    dx_tolerance: float = 15.0,
+    enable_beam_correction: bool = True,
+    use_sahi: bool = False,
+    sahi_slice_size: int = 640,
+    sahi_overlap: float = 0.25,
 ) -> str:
     """
     Full custom YOLO inference pipeline: detect → map pitches → generate MusicXML.
@@ -678,13 +782,23 @@ def generation_workflow_custom_yolo(
         raise FileNotFoundError(f"[CustomYOLO] Cannot read image: {image_path}")
     
     # --- Step 2: Run YOLO detection ---
-    detections = run_detection(image_path, conf=conf)
+    if use_sahi:
+        detections = run_detection_sahi(
+            image_path, conf=conf, iou=iou,
+            slice_size=sahi_slice_size, overlap_ratio=sahi_overlap,
+        )
+    else:
+        detections = run_detection(image_path, conf=conf, iou=iou)
 
     if not detections:
         print("[CustomYOLO] ⚠️ No symbols detected! Generating empty MusicXML.")
 
     # --- Step 3: Convert detections to musical events ---
-    events = detections_to_events(detections, staffs, gray_image)
+    events = detections_to_events(
+        detections, staffs, gray_image,
+        dx_tolerance=dx_tolerance,
+        enable_beam_correction=enable_beam_correction
+    )
 
     # --- Step 4: Generate MusicXML ---
     xml_content = events_to_musicxml(events, title="Custom YOLO OMR Detection")
@@ -702,6 +816,6 @@ def generation_workflow_custom_yolo(
 
     # --- Step 5: Save diagnostic image ---
     diag_path = os.path.join(output_dir, "yolo_detections.png")
-    save_diagnostic_image(image_path, detections, staffs, diag_path)
+    save_diagnostic_image(image_path, detections, staffs, chord_events, diag_path)
 
     return output_xml_path

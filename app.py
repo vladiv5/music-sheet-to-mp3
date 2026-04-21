@@ -6,7 +6,9 @@ from music21 import converter, note, chord
 from pdf2image import convert_from_path
 from core.image_processing import generation_workflow_oemer
 from models.custom_yolo_inference import generation_workflow_custom_yolo
+from models.primitive_yolo_inference import generation_workflow_primitive_yolo
 from core.audio_synthesis import convert_xml_to_mp3
+from core.density_scorer import compute_density_score
 
 # I configure the basic settings for my web page
 st.set_page_config(page_title="Music Sheet to MP3", page_icon="🎵", layout="wide")
@@ -93,7 +95,10 @@ def _extract_notes_text(xml_path):
         return [f"⚠️ Could not parse notes: {e}"]
 
 
-def _run_single_engine(engine_name, image_path, working_dir, conf=0.25, container=None):
+def _run_single_engine(engine_name, image_path, working_dir, conf=0.25, iou=0.7,
+                       dx_tolerance=15.0, enable_beam_correction=True,
+                       use_sahi=False, sahi_slice_size=640, sahi_overlap=0.25,
+                       staves_per_system=1, time_signature="4/4", container=None):
     """
     Run a single AI engine and return a results dict.
     If container is provided, outputs are rendered into that Streamlit container.
@@ -106,7 +111,31 @@ def _run_single_engine(engine_name, image_path, working_dir, conf=0.25, containe
         xml_result = generation_workflow_oemer(image_path, output_dir=working_dir)
         _rescue_oemer_cache(image_path, working_dir)
     elif engine_name == "Custom YOLO Model":
-        xml_result = generation_workflow_custom_yolo(image_path, output_dir=working_dir, conf=conf)
+        xml_result = generation_workflow_custom_yolo(
+            image_path,
+            output_dir=working_dir,
+            conf=conf,
+            iou=iou,
+            dx_tolerance=dx_tolerance,
+            enable_beam_correction=enable_beam_correction,
+            use_sahi=use_sahi,
+            sahi_slice_size=sahi_slice_size,
+            sahi_overlap=sahi_overlap,
+        )
+    elif engine_name == "YOLOv8s Primitives (35-cls)":
+        xml_result = generation_workflow_primitive_yolo(
+            image_path,
+            output_dir=working_dir,
+            conf=conf,
+            iou=iou,
+            dx_tolerance=dx_tolerance,
+            enable_beam_correction=enable_beam_correction,
+            use_sahi=use_sahi,
+            sahi_slice_size=sahi_slice_size,
+            sahi_overlap=sahi_overlap,
+            staves_per_system=staves_per_system,
+            time_signature=time_signature,
+        )
     else:
         raise ValueError(f"Unknown AI engine: {engine_name}")
 
@@ -132,6 +161,7 @@ def _run_single_engine(engine_name, image_path, working_dir, conf=0.25, containe
         "processing_time": processing_time,
         "notes": notes,
         "note_count": len([n for n in notes if not n.startswith("⚠️")]),
+        "chord_count": len([n for n in notes if "[" in n]),
         "diag_images": diag_images,
     }
 
@@ -168,31 +198,89 @@ def _display_results(result, container=None):
 
 
 # ---------------------------------------------------------------------------
+# Developer Panel (Sidebar)
+# ---------------------------------------------------------------------------
+
+st.sidebar.title("🛠️ Developer Panel")
+st.sidebar.caption("Fine-tune parameters for Custom YOLO engine.")
+
+with st.sidebar.expander("🎯 YOLO Detection", expanded=True):
+    yolo_conf = st.slider(
+        "Confidence Threshold",
+        min_value=0.05, max_value=0.95, value=0.25, step=0.05,
+        help="Lower = more detections (including noise). Higher = only confident detections."
+    )
+    yolo_iou = st.slider(
+        "NMS IoU Threshold",
+        min_value=0.1, max_value=0.9, value=0.7, step=0.1,
+        help="Higher = allows overlapping noteheads (crucial for chords)."
+    )
+
+with st.sidebar.expander("🎹 Polyphony & Rhythm", expanded=True):
+    yolo_dx = st.slider(
+        "Chord Grouping Tolerance (px)",
+        min_value=5.0, max_value=30.0, value=15.0, step=1.0,
+        help="Max X-distance between notes to be grouped as a chord."
+    )
+    staves_per_system = st.slider(
+        "Staves per System",
+        min_value=1, max_value=4, value=1, step=1,
+        help="1 = Solo Instrument / Single Staff, 2 = Piano (Left/Right hand played parallel)"
+    )
+    time_signature = st.selectbox(
+        "Time Signature",
+        ["4/4", "3/4", "2/4", "6/8", "12/8"],
+        index=0,
+        help="Used to mathematically align Left/Right hands on barline boundaries."
+    )
+    enable_beams = st.checkbox(
+        "Enable Geometric Beam Analysis",
+        value=True,
+        help="Overrides YOLO's rhythm by analyzing stems for beams/flags (HoughLinesP)."
+    )
+
+with st.sidebar.expander("🧠 Smart Auto / SAHI", expanded=True):
+    density_threshold = st.slider(
+        "Density Threshold",
+        min_value=0.10, max_value=0.80, value=0.35, step=0.05,
+        help="Score above which SAHI is activated automatically in Smart Auto mode."
+    )
+    force_sahi = st.checkbox(
+        "⚡ Force SAHI (Debug)",
+        value=False,
+        help="Override Smart Auto: always use SAHI sliced inference regardless of density."
+    )
+
+with st.sidebar.expander("⚙️ Advanced Settings"):
+    sahi_slice_size = st.number_input(
+        "SAHI Slice Size (px)", value=640, min_value=320, max_value=1280, step=64,
+        help="Patch size for SAHI tiling. 640 is optimal for your model."
+    )
+    sahi_overlap = st.slider(
+        "SAHI Overlap Ratio",
+        min_value=0.1, max_value=0.5, value=0.25, step=0.05,
+        help="Overlap between SAHI patches. Higher = more redundancy but fewer missed objects."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main UI
 # ---------------------------------------------------------------------------
 
 if uploaded_file is not None:
     st.info(f"File uploaded: {uploaded_file.name}")
 
-    # --- A/B TESTING SETUP ---
-    col_config1, col_config2 = st.columns([2, 1])
-
-    with col_config1:
-        selected_model = st.selectbox(
-            "🤖 Select the AI Engine:",
-            ["Oemer Baseline", "Custom YOLO Model", "🔬 Benchmark (Both Models)"]
-        )
-
-    with col_config2:
-        # Confidence slider — only relevant for Custom YOLO
-        yolo_conf = st.slider(
-            "🎯 YOLO Confidence Threshold",
-            min_value=0.05,
-            max_value=0.95,
-            value=0.25,
-            step=0.05,
-            help="Lower = more detections (including noise). Higher = only confident detections."
-        )
+    # --- Engine Selection ---
+    selected_model = st.selectbox(
+        "🤖 Select the AI Engine:",
+        [
+            "🧠 Smart Auto (Density-Based)",
+            "YOLOv8s Primitives (35-cls)",
+            "Custom YOLO Model",
+            "Oemer Baseline",
+            "🔬 Benchmark (Both Models)",
+        ]
+    )
 
     if st.button("🚀 Generate Audio", type="primary"):
 
@@ -204,12 +292,76 @@ if uploaded_file is not None:
                 image_to_process = _prepare_image(uploaded_file, WORKING_DIR)
                 st.image(image_to_process, caption="Input Image", use_container_width=True)
 
+                yolo_kwargs = dict(
+                    conf=yolo_conf, iou=yolo_iou,
+                    dx_tolerance=yolo_dx, enable_beam_correction=enable_beams,
+                    use_sahi=force_sahi, sahi_slice_size=sahi_slice_size,
+                    sahi_overlap=sahi_overlap,
+                )
+                
+                # Primitive model accepts staves_per_system and time_signature
+                primitive_kwargs = dict(yolo_kwargs)
+                primitive_kwargs["staves_per_system"] = staves_per_system
+                primitive_kwargs["time_signature"] = time_signature
+
                 # ===================================================================
-                # MODE 1 & 2: Single engine (Oemer or Custom YOLO)
+                # MODE 0: Smart Auto — density scorer chooses engine
                 # ===================================================================
-                if selected_model in ["Oemer Baseline", "Custom YOLO Model"]:
+                if selected_model == "🧠 Smart Auto (Density-Based)":
+                    with st.spinner("🧮 Analyzing page density..."):
+                        density_report = compute_density_score(
+                            image_to_process,
+                            density_threshold=density_threshold,
+                        )
+
+                    # --- Display density gauge ---
+                    d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+                    d_col1.metric("Density Score", f"{density_report.overall_score:.2f}")
+                    d_col2.metric("Ink", f"{density_report.ink_density:.2f}")
+                    d_col3.metric("Vertical", f"{density_report.vertical_complexity:.2f}")
+                    d_col4.metric("Staff Load", f"{density_report.staff_utilization:.2f}")
+
+                    # --- Determine engine and SAHI ---
+                    if density_report.recommendation == 'oemer':
+                        auto_engine = "Oemer Baseline"
+                        auto_sahi = False
+                        st.warning(f"{density_report.label} — Routing to **Oemer** "
+                                   f"(density {density_report.overall_score:.2f} ≥ "
+                                   f"{density_threshold + 0.20:.2f})")
+                    elif density_report.recommendation == 'sahi':
+                        auto_engine = "Custom YOLO Model"
+                        auto_sahi = True
+                        st.info(f"{density_report.label} — Routing to **YOLO + SAHI** "
+                                f"(density {density_report.overall_score:.2f} ≥ "
+                                f"{density_threshold:.2f})")
+                    else:
+                        auto_engine = "Custom YOLO Model"
+                        auto_sahi = force_sahi
+                        st.success(f"{density_report.label} — Routing to **YOLO Standard** "
+                                   f"(density {density_report.overall_score:.2f} < "
+                                   f"{density_threshold:.2f})")
+
+                    yolo_kwargs['use_sahi'] = auto_sahi or force_sahi
+
                     result = _run_single_engine(
-                        selected_model, image_to_process, WORKING_DIR, conf=yolo_conf
+                        auto_engine, image_to_process, WORKING_DIR, **yolo_kwargs
+                    )
+                    st.success(f"✅ Conversion Complete with {auto_engine}!")
+                    _display_results(result)
+
+                # ===================================================================
+                # MODE 1 & 2 & 3: Single engine (Oemer, Custom YOLO, Primitive YOLO)
+                # ===================================================================
+                elif selected_model in ["Oemer Baseline", "Custom YOLO Model"]:
+                    result = _run_single_engine(
+                        selected_model, image_to_process, WORKING_DIR, **yolo_kwargs
+                    )
+                    st.success(f"✅ Conversion Complete with {selected_model}!")
+                    _display_results(result)
+                    
+                elif selected_model == "YOLOv8s Primitives (35-cls)":
+                    result = _run_single_engine(
+                        selected_model, image_to_process, WORKING_DIR, **primitive_kwargs
                     )
                     st.success(f"✅ Conversion Complete with {selected_model}!")
                     _display_results(result)
@@ -223,8 +375,6 @@ if uploaded_file is not None:
                     # --- Run Oemer first ---
                     oemer_dir = os.path.join(WORKING_DIR, "benchmark_oemer")
                     os.makedirs(oemer_dir, exist_ok=True)
-
-                    # Copy the image to oemer's working directory
                     oemer_image = os.path.join(oemer_dir, os.path.basename(image_to_process))
                     shutil.copy2(image_to_process, oemer_image)
 
@@ -235,12 +385,11 @@ if uploaded_file is not None:
                     # --- Run Custom YOLO ---
                     yolo_dir = os.path.join(WORKING_DIR, "benchmark_yolo")
                     os.makedirs(yolo_dir, exist_ok=True)
-
                     yolo_image = os.path.join(yolo_dir, os.path.basename(image_to_process))
                     shutil.copy2(image_to_process, yolo_image)
 
                     yolo_result = _run_single_engine(
-                        "Custom YOLO Model", yolo_image, yolo_dir, conf=yolo_conf
+                        "Custom YOLO Model", yolo_image, yolo_dir, **yolo_kwargs
                     )
 
                     # --- Display side-by-side ---
@@ -251,27 +400,18 @@ if uploaded_file is not None:
                     st.markdown("---")
 
                     metric_col1, metric_col2, metric_col3 = st.columns(3)
-
                     with metric_col1:
                         st.metric("Metric", "—")
-
                     with metric_col2:
-                        st.metric(
-                            "⏱️ Oemer Time",
-                            f"{oemer_result['processing_time']:.2f}s"
-                        )
-
+                        st.metric("⏱️ Oemer Time",
+                                  f"{oemer_result['processing_time']:.2f}s")
                     with metric_col3:
-                        # Show delta vs Oemer
                         delta = yolo_result['processing_time'] - oemer_result['processing_time']
-                        st.metric(
-                            "⏱️ YOLO Time",
-                            f"{yolo_result['processing_time']:.2f}s",
-                            delta=f"{delta:+.2f}s vs Oemer",
-                            delta_color="inverse"  # negative delta = YOLO is faster = good
-                        )
+                        st.metric("⏱️ YOLO Time",
+                                  f"{yolo_result['processing_time']:.2f}s",
+                                  delta=f"{delta:+.2f}s vs Oemer",
+                                  delta_color="inverse")
 
-                    # Notes count comparison
                     note_col1, note_col2, note_col3 = st.columns(3)
                     with note_col1:
                         st.metric("📝", "Notes Detected")
@@ -279,13 +419,19 @@ if uploaded_file is not None:
                         st.metric("Oemer", str(oemer_result['note_count']))
                     with note_col3:
                         note_delta = yolo_result['note_count'] - oemer_result['note_count']
-                        st.metric(
-                            "YOLO",
-                            str(yolo_result['note_count']),
-                            delta=f"{note_delta:+d} vs Oemer"
-                        )
+                        st.metric("YOLO", str(yolo_result['note_count']),
+                                  delta=f"{note_delta:+d} vs Oemer")
 
-                    # Confidence threshold display
+                    chord_col1, chord_col2, chord_col3 = st.columns(3)
+                    with chord_col1:
+                        st.metric("🎹", "Chords Detected")
+                    with chord_col2:
+                        st.metric("Oemer", str(oemer_result['chord_count']))
+                    with chord_col3:
+                        chord_delta = yolo_result['chord_count'] - oemer_result['chord_count']
+                        st.metric("YOLO", str(yolo_result['chord_count']),
+                                  delta=f"{chord_delta:+d} vs Oemer")
+
                     conf_col1, conf_col2, conf_col3 = st.columns(3)
                     with conf_col1:
                         st.metric("🎯", "Confidence")
@@ -296,13 +442,10 @@ if uploaded_file is not None:
 
                     st.markdown("---")
 
-                    # Side-by-side detailed results
                     col_oemer, col_yolo = st.columns(2)
-
                     with col_oemer:
                         st.header("🅰️ Oemer Baseline")
                         _display_results(oemer_result, container=col_oemer)
-
                     with col_yolo:
                         st.header("🅱️ Custom YOLO Model")
                         _display_results(yolo_result, container=col_yolo)

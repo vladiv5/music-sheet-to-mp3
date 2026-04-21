@@ -85,3 +85,32 @@ Following the initial YOLO training, the project focus shifted to accurately ext
 *   **Classical CV Staff Detection:** Implemented `core/staff_detector.py`, a pure OpenCV module that detects the horizontal staff grid using morphological operations and row-projection profiles. It uniquely identifies systems of 5 lines and computes spatial measurements (e.g., inter-line pacing).
 *   **Pitch Mapping Strategy:** By isolating the staff framework, YOLO bounding-box Y-coordinates can be mapped natively into precise musical pitches, taking interline spacing and ledger lines into account.
 *   **Blob Extraction Pipeline:** Actively implementing shape-based notehead detection to effectively separate isolated noteheads from stems or overlapping staff lines.
+
+## Deep Primitive Inference & Polyphonic Synchronization (2026-04-21)
+
+Today's session marked a massive leap forward into full polyphony support and mathematical rhythm synchronization. We integrated the new custom-trained `YOLOv8s` (35 primitive classes) into the main pipeline and solved several critical OMR architecture challenges.
+
+### 1. Primitive Assembly Engine
+Instead of hoping the neural network perfectly reads complete objects right away, we built `core/primitive_assembler.py` which takes raw primitives (e.g., `noteheadBlack`, `flag8thUp`, `augmentationDot`, `beam`) and mathematically groups them together based on proximity. This constructs cohesive musical objects ready for XML mapping.
+*   **Beam Parsing:** If a notehead's X-axis intersects a detected horizontal `beam` bounding box, their duration is dynamically shifted to `eighth` (1 beam overlap) or `16th` (2+ beam overlaps).
+
+### 2. Multi-Stave/Polyphony (Grand Staff Support)
+We overhauled the XML assembler in `models/primitive_yolo_inference.py` to support parallel hand playback. 
+*   Added a `Staves per System` UI slider. 
+*   By setting it to `2` (Piano), the model segregates notes on the top staves (odd index) as Part 1 (Right Hand, forced to Treble Clef) and bottom staves (even index) as Part 2 (Left Hand, forced to Bass Clef). They are emitted into sibling `<part>` streams in MusicXML, ensuring both hands synthesize perfectly simultaneously.
+
+### 3. Spatial Barline Detection (Computer Vision)
+A major vulnerability in sequential pipeline playback was "rhythmic drift" - if YOLO missed a left-hand note, the left-hand track would shift out of sync with the right hand. To fix this, we created `core/barline_detector.py`:
+*   Applied a vertical Otsu binarization and `cv2.morphologyEx(MORPH_OPEN)` with a vertical kernel height of `3.5 * interline` to extract bar lines visually without YOLO.
+*   **Stem Filtering Algorithm:** To prevent false positives where note stems are mistaken as barlines, we applied an intersection filter matrix: if a vertical line is shorter than `6.0 * interline` and its X-center is within `< 0.85 * interline` of a raw `notehead`, it is discarded as a stem. Tall barlines (e.g., `h > 10 * interline`) bridging multiple staves bypass this filter.
+
+### 4. The "Rhythm Enforcer" & Ghost Measure Pruner
+We modified `_split_into_measures` to slice notes spatially using the X-coordinates provided by the barline detector. The user feeds the "Time Signature" (e.g., `3/4`) into the UI:
+*   Formula: `target_beats = (numerator) * (4.0 / denominator)`
+*   When a spatial interval (a measure bounded by two vertical lines) lacks the required beats due to YOLO missing a note, the Enforcer mathematically injects a padding `<rest>` element at the end of the measure, bringing the beat count to exact synchronization.
+*   **Ghost Measures:** Empty spatial arrays left before the first barline or after the last barline are algorithmically pruned if no hand has any notes within that interval, avoiding hallucinated silence blocks.
+
+### Current Limitations & Next Roadmap
+Testing this mathematical rigidity on highly complex, dense arrangements exposed classic limitations:
+1.  **NMS Crowding:** Dense 16th-note chords cause YOLO to skip detecting small noteheads due to bounding-box overlaps causing Non-Maximum Suppression (NMS) collisions. Without notehead anchors, the stems fail the OpenCV stem filter and are falsely declared tracking barlines.
+2.  **Proposed Fix:** During the next session, we will strictly integrate **SAHI (Slicing Aided Hyper Inference)**. By dividing the image into overlapping ~640x640 patches, we will forcefully upscale dense note clusters, significantly increasing recall without overwhelming the YOLO architecture.

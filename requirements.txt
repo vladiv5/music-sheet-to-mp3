@@ -1,4 +1,4 @@
-numpy<2.0.0
+﻿numpy<2.0.0
 oemer
 music21
 midi2audio
@@ -10,3 +10,4 @@ scikit-learn==1.2.0
 pdf2image
 ultralytics
 opencv-python-headless
+sahi

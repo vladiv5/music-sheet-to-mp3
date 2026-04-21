@@ -1,0 +1,30 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Large datasets
+dataset/
+
+# YOLO Training outputs
+runs/
+training/
+rezultate_test*/
+
+# Temporary directories
+temp_ai/
+tests/current_test/
+
+# Large Model Files
+*.pt
+*.onnx
+*.h5
+
+# Audio output generated locally
+*.wav
+*.mp3
+*.mid
