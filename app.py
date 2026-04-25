@@ -27,9 +27,9 @@ WORKING_DIR = "./tests/current_test"
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def _prepare_image(uploaded_file, working_dir):
+def _prepare_images(uploaded_file, working_dir):
     """
-    Handle PDF-to-image conversion if needed. Returns the path to the image
+    Handle PDF-to-image conversion if needed. Returns a list of paths to the images
     that should be processed by the AI engine.
     """
     local_file_path = os.path.join(working_dir, uploaded_file.name)
@@ -37,22 +37,23 @@ def _prepare_image(uploaded_file, working_dir):
         f.write(uploaded_file.getbuffer())
 
     if uploaded_file.name.lower().endswith(".pdf"):
-        st.info("PDF format detected. Extracting the first page for analysis...")
+        st.info("PDF format detected. Extracting all pages for analysis...")
         pages = convert_from_path(
             local_file_path,
             dpi=300,
-            first_page=1,
-            last_page=1,
             output_folder=working_dir
         )
         if not pages:
             raise ValueError("The PDF appears to be empty or unreadable.")
 
-        image_to_process = os.path.join(working_dir, "extracted_page_1.png")
-        pages[0].save(image_to_process, "PNG")
-        return image_to_process
+        image_paths = []
+        for idx, page in enumerate(pages):
+            image_to_process = os.path.join(working_dir, f"extracted_page_{idx+1}.png")
+            page.save(image_to_process, "PNG")
+            image_paths.append(image_to_process)
+        return image_paths
     else:
-        return local_file_path
+        return [local_file_path]
 
 
 def _clean_working_dir(working_dir):
@@ -95,68 +96,107 @@ def _extract_notes_text(xml_path):
         return [f"⚠️ Could not parse notes: {e}"]
 
 
-def _run_single_engine(engine_name, image_path, working_dir, conf=0.25, iou=0.7,
+def _run_single_engine(engine_name, image_paths, working_dir, conf=0.25, iou=0.7,
                        dx_tolerance=15.0, enable_beam_correction=True,
                        use_sahi=False, sahi_slice_size=640, sahi_overlap=0.25,
-                       staves_per_system=1, time_signature="4/4", container=None):
+                       staves_per_system=1, time_signature="4/4", instrument="Acoustic Grand Piano",
+                       use_measure_sahi=False, use_ai_barlines=False, container=None):
     """
     Run a single AI engine and return a results dict.
     If container is provided, outputs are rendered into that Streamlit container.
     """
     ctx = container or st
 
+    if not isinstance(image_paths, list):
+        image_paths = [image_paths]
+
     t_start = time.perf_counter()
 
-    if engine_name == "Oemer Baseline":
-        xml_result = generation_workflow_oemer(image_path, output_dir=working_dir)
-        _rescue_oemer_cache(image_path, working_dir)
-    elif engine_name == "Custom YOLO Model":
-        xml_result = generation_workflow_custom_yolo(
-            image_path,
-            output_dir=working_dir,
-            conf=conf,
-            iou=iou,
-            dx_tolerance=dx_tolerance,
-            enable_beam_correction=enable_beam_correction,
-            use_sahi=use_sahi,
-            sahi_slice_size=sahi_slice_size,
-            sahi_overlap=sahi_overlap,
-        )
-    elif engine_name == "YOLOv8s Primitives (35-cls)":
-        xml_result = generation_workflow_primitive_yolo(
-            image_path,
-            output_dir=working_dir,
-            conf=conf,
-            iou=iou,
-            dx_tolerance=dx_tolerance,
-            enable_beam_correction=enable_beam_correction,
-            use_sahi=use_sahi,
-            sahi_slice_size=sahi_slice_size,
-            sahi_overlap=sahi_overlap,
-            staves_per_system=staves_per_system,
-            time_signature=time_signature,
-        )
+    combined_score = None
+    final_xml_path = os.path.join(working_dir, "combined_output.musicxml")
+
+    # 1. INIȚIALIZĂM MEMORIA ARMURII AICI:
+    current_fifths = None 
+
+    # Progress bar for pages
+    progress_bar = ctx.progress(0.0, text=f"Processing page 1 of {len(image_paths)}...")
+
+    for idx, img_path in enumerate(image_paths):
+        progress_bar.progress((idx) / len(image_paths), text=f"Processing page {idx + 1} of {len(image_paths)} with {engine_name}...")
+        
+        if engine_name == "Oemer Baseline":
+            xml_result = generation_workflow_oemer(img_path, output_dir=working_dir)
+            if idx == 0: _rescue_oemer_cache(img_path, working_dir)
+            
+        elif engine_name == "Custom YOLO Model":
+            xml_result = generation_workflow_custom_yolo(
+                img_path,
+                output_dir=working_dir,
+                conf=conf, iou=iou,
+                dx_tolerance=dx_tolerance, enable_beam_correction=enable_beam_correction,
+                use_sahi=use_sahi, sahi_slice_size=sahi_slice_size, sahi_overlap=sahi_overlap,
+            )
+            
+        elif engine_name == "YOLOv8s Primitives":
+            # 2. PRELUĂM ȘI TRIMITEM ARMURA MAI DEPARTE AICI:
+            xml_result, current_fifths = generation_workflow_primitive_yolo(
+                img_path,
+                output_dir=working_dir,
+                conf=conf, iou=iou,
+                dx_tolerance=dx_tolerance, enable_beam_correction=enable_beam_correction,
+                use_sahi=use_sahi, sahi_slice_size=sahi_slice_size, sahi_overlap=sahi_overlap,
+                staves_per_system=staves_per_system, time_signature=time_signature,
+                use_ai_barlines=use_ai_barlines,
+                use_measure_sahi=use_measure_sahi,
+                inherited_fifths=current_fifths  # <--- Transmitem memoria de la pagina anterioară!
+            )
+        else:
+            raise ValueError(f"Unknown AI engine: {engine_name}")
+
+        # Stitching logic using music21
+        try:
+            page_score = converter.parse(xml_result)
+            if combined_score is None:
+                combined_score = page_score
+            else:
+                for i, part in enumerate(page_score.parts):
+                    if i < len(combined_score.parts):
+                        for m in part.getElementsByClass('Measure'):
+                            combined_score.parts[i].append(m)
+        except Exception as e:
+            print(f"Failed to stitch page {idx + 1}: {e}")
+
+    progress_bar.progress(1.0, text="Stitching complete! Synthesizing audio...")
+    
+    if combined_score is not None:
+        combined_score.write('musicxml', fp=final_xml_path)
     else:
-        raise ValueError(f"Unknown AI engine: {engine_name}")
+        final_xml_path = xml_result # fallback
 
     t_end = time.perf_counter()
     processing_time = t_end - t_start
 
-    # Synthesize audio
-    audio_result = convert_xml_to_mp3(xml_result, soundfont_file)
+    # Synthesize audio with instrument selection
+    audio_result = convert_xml_to_mp3(final_xml_path, soundfont_file, instrument_name=instrument)
 
-    # Extract notes
-    notes = _extract_notes_text(xml_result)
+    # Extract notes from the final combined output
+    notes = _extract_notes_text(final_xml_path)
 
-    # Collect diagnostic images
+    # Collect diagnostic images (sorted by page number)
     diag_images = []
+    excluded = {uploaded_file.name}
+    # Exclude all extracted_page_*.png files from diagnostics
     for f in os.listdir(working_dir):
-        if f.endswith(".png") and f not in [uploaded_file.name, "extracted_page_1.png"]:
+        if f.startswith("extracted_page_") and f.endswith(".png"):
+            excluded.add(f)
+    for f in sorted(os.listdir(working_dir)):
+        if f.endswith(".png") and f not in excluded:
             diag_images.append(os.path.join(working_dir, f))
 
     return {
         "engine": engine_name,
-        "xml_path": xml_result,
+        "xml_path": final_xml_path,
+        "midi_path": final_xml_path.replace(".musicxml", ".mid"),
         "audio_path": audio_result,
         "processing_time": processing_time,
         "notes": notes,
@@ -180,6 +220,25 @@ def _display_results(result, container=None):
     ctx.subheader("🔊 Audio Output")
     with open(result["audio_path"], "rb") as af:
         ctx.audio(af.read(), format="audio/wav")
+
+    # Download Buttons
+    ctx.subheader("💾 Export Options")
+    col1, col2 = ctx.columns(2)
+    with open(result["xml_path"], "r", encoding="utf-8") as f:
+        col1.download_button(
+            label="Download MusicXML",
+            data=f.read(),
+            file_name="output.musicxml",
+            mime="application/vnd.recordare.musicxml+xml"
+        )
+    if "midi_path" in result and os.path.exists(result["midi_path"]):
+        with open(result["midi_path"], "rb") as f:
+            col2.download_button(
+                label="Download MIDI",
+                data=f.read(),
+                file_name="output.mid",
+                mime="audio/midi"
+            )
 
     # Note sequence
     ctx.subheader(f"🎶 Detected Notes ({result['note_count']})")
@@ -229,9 +288,9 @@ with st.sidebar.expander("🎹 Polyphony & Rhythm", expanded=True):
     )
     time_signature = st.selectbox(
         "Time Signature",
-        ["4/4", "3/4", "2/4", "6/8", "12/8"],
+        ["4/4", "3/4", "2/4", "2/2", "3/8", "5/4", "5/8", "6/4", "6/8", "7/8", "9/8", "12/8"],
         index=0,
-        help="Used to mathematically align Left/Right hands on barline boundaries."
+        help="Matches the score's time signature. Menuet = 3/4, Unravel = 4/4, waltzes = 3/4, etc."
     )
     enable_beams = st.checkbox(
         "Enable Geometric Beam Analysis",
@@ -250,16 +309,17 @@ with st.sidebar.expander("🧠 Smart Auto / SAHI", expanded=True):
         value=False,
         help="Override Smart Auto: always use SAHI sliced inference regardless of density."
     )
-
-with st.sidebar.expander("⚙️ Advanced Settings"):
-    sahi_slice_size = st.number_input(
-        "SAHI Slice Size (px)", value=640, min_value=320, max_value=1280, step=64,
-        help="Patch size for SAHI tiling. 640 is optimal for your model."
+with st.sidebar.expander("🛠️ Advanced Settings", expanded=False):
+    audio_instrument = st.selectbox(
+        "Audio Instrument",
+        ["Acoustic Grand Piano", "Violin", "Flute", "Acoustic Guitar", "Trumpet", "Cello"],
+        index=0,
+        help="Select the instrument for audio synthesis."
     )
-    sahi_overlap = st.slider(
-        "SAHI Overlap Ratio",
-        min_value=0.1, max_value=0.5, value=0.25, step=0.05,
-        help="Overlap between SAHI patches. Higher = more redundancy but fewer missed objects."
+    process_first_page_only = st.checkbox(
+        "⚡ Fast Mode: Process 1st Page Only",
+        value=True,
+        help="If checked, ignores the rest of the PDF pages to speed up debugging."
     )
 
 
@@ -274,9 +334,8 @@ if uploaded_file is not None:
     selected_model = st.selectbox(
         "🤖 Select the AI Engine:",
         [
-            "🧠 Smart Auto (Density-Based)",
-            "YOLOv8s Primitives (35-cls)",
-            "Custom YOLO Model",
+            "YOLOv8s Primitives + AI Barlines (Recommended)",
+            "YOLOv8s Primitives (OpenCV Barlines)",
             "Oemer Baseline",
             "🔬 Benchmark (Both Models)",
         ]
@@ -289,34 +348,46 @@ if uploaded_file is not None:
 
         with st.spinner("Preparing file and analyzing notes... (This may take a while)"):
             try:
-                image_to_process = _prepare_image(uploaded_file, WORKING_DIR)
-                st.image(image_to_process, caption="Input Image", use_container_width=True)
+                image_paths = _prepare_images(uploaded_file, WORKING_DIR)
+                if len(image_paths) == 1:
+                    st.image(image_paths[0], caption="Input Image", use_container_width=True)
+                else:
+                    st.info(f"Loaded {len(image_paths)} pages. Previewing the first page...")
+                    st.image(image_paths[0], caption="Input Image (Page 1)", use_container_width=True)
+
+                # -------------------------------------------------------------------
+                # Fast Mode slicing
+                # -------------------------------------------------------------------
+                if process_first_page_only and len(image_paths) > 1:
+                    image_paths = image_paths[:1]
+                    st.info("⚡ Fast Mode active: Processing only the first page of the PDF.")
 
                 yolo_kwargs = dict(
                     conf=yolo_conf, iou=yolo_iou,
                     dx_tolerance=yolo_dx, enable_beam_correction=enable_beams,
-                    use_sahi=force_sahi, sahi_slice_size=sahi_slice_size,
-                    sahi_overlap=sahi_overlap,
+                    use_sahi=False, sahi_slice_size=640,
+                    sahi_overlap=0.25,
                 )
                 
                 # Primitive model accepts staves_per_system and time_signature
                 primitive_kwargs = dict(yolo_kwargs)
                 primitive_kwargs["staves_per_system"] = staves_per_system
                 primitive_kwargs["time_signature"] = time_signature
+                primitive_kwargs["use_measure_sahi"] = False  # default off
 
                 # ===================================================================
                 # MODE 0: Smart Auto — density scorer chooses engine
                 # ===================================================================
                 if selected_model == "🧠 Smart Auto (Density-Based)":
-                    with st.spinner("🧮 Analyzing page density..."):
+                    with st.spinner(f"🧮 Analyzing page density for {len(image_paths)} pages..."):
                         density_report = compute_density_score(
-                            image_to_process,
+                            image_paths[0], # Evaluate density on first page
                             density_threshold=density_threshold,
                         )
 
                     # --- Display density gauge ---
                     d_col1, d_col2, d_col3, d_col4 = st.columns(4)
-                    d_col1.metric("Density Score", f"{density_report.overall_score:.2f}")
+                    d_col1.metric("Density Score (Pg 1)", f"{density_report.overall_score:.2f}")
                     d_col2.metric("Ink", f"{density_report.ink_density:.2f}")
                     d_col3.metric("Vertical", f"{density_report.vertical_complexity:.2f}")
                     d_col4.metric("Staff Load", f"{density_report.staff_utilization:.2f}")
@@ -344,24 +415,26 @@ if uploaded_file is not None:
                     yolo_kwargs['use_sahi'] = auto_sahi or force_sahi
 
                     result = _run_single_engine(
-                        auto_engine, image_to_process, WORKING_DIR, **yolo_kwargs
+                        auto_engine, image_paths, WORKING_DIR, instrument=audio_instrument, **yolo_kwargs
                     )
                     st.success(f"✅ Conversion Complete with {auto_engine}!")
                     _display_results(result)
 
                 # ===================================================================
-                # MODE 1 & 2 & 3: Single engine (Oemer, Custom YOLO, Primitive YOLO)
+                # MODE 1: Explicit Custom YOLO
                 # ===================================================================
-                elif selected_model in ["Oemer Baseline", "Custom YOLO Model"]:
+                if selected_model in ["YOLOv8s Primitives + AI Barlines (Recommended)", "YOLOv8s Primitives (OpenCV Barlines)"]:
+                    use_ai_barlines = selected_model == "YOLOv8s Primitives + AI Barlines (Recommended)"
+                    primitive_kwargs["use_ai_barlines"] = use_ai_barlines
                     result = _run_single_engine(
-                        selected_model, image_to_process, WORKING_DIR, **yolo_kwargs
+                        "YOLOv8s Primitives", image_paths, WORKING_DIR, instrument=audio_instrument, **primitive_kwargs
                     )
                     st.success(f"✅ Conversion Complete with {selected_model}!")
                     _display_results(result)
-                    
-                elif selected_model == "YOLOv8s Primitives (35-cls)":
+
+                elif selected_model in ["Oemer Baseline", "Custom YOLO Model"]:
                     result = _run_single_engine(
-                        selected_model, image_to_process, WORKING_DIR, **primitive_kwargs
+                        selected_model, image_paths, WORKING_DIR, instrument=audio_instrument, **yolo_kwargs
                     )
                     st.success(f"✅ Conversion Complete with {selected_model}!")
                     _display_results(result)

@@ -118,3 +118,13 @@ I modified `_split_into_measures` to slice notes spatially using the X-coordinat
 Testing this mathematical rigidity on highly complex, dense arrangements exposed classic limitations:
 1.  **NMS Crowding:** Dense 16th-note chords cause YOLO to skip detecting small noteheads due to bounding-box overlaps causing Non-Maximum Suppression (NMS) collisions. Without notehead anchors, the stems fail the OpenCV stem filter and are falsely declared tracking barlines.
 2.  **Proposed Fix:** During the next session, I will strictly integrate **SAHI (Slicing Aided Hyper Inference)**. By dividing the image into overlapping ~640x640 patches, I will forcefully upscale dense note clusters, significantly increasing recall without overwhelming the YOLO architecture.
+
+## System Optimization & UI Refinements (2026-04-25)
+
+After establishing a solid polyphonic foundation, the focus shifted towards optimizing the existing pipeline and maximizing the output quality without retraining the core models.
+
+### Key Enhancements
+* **Streamlit Developer Panel Cleanup:** Refactored the UI to eliminate duplicate inference parameters. The YOLO settings (Confidence, NMS IoU, Chord Grouping Tolerance) are now strictly singular and definitively wired into the inference engine (`yolo_kwargs`), ensuring WYSIWYG (What You See Is What You Get) testing.
+* **Key Signature Memory Across Pages:** Implemented a state-passing mechanism to retain the inferred global key signature (number of fifths) from the first page and cascade it through all subsequent pages. This prevents the model from dropping the key signature on mid-song pages where the clef might not be accompanied by the explicit accidentals.
+* **Algorithmic Voting & Confidence:** The system now uses majority voting across staves to infer the global key signature of a page, applying it globally to map steps and alterations dynamically.
+* **AI vs. OpenCV Barlines:** The UI now explicitly recommends the `Barline Nano` AI model over OpenCV for robust vertical segmentation, significantly reducing issues with heavy text or complex repeats.

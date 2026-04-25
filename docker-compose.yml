@@ -14,12 +14,15 @@ services:
       # --- DATASETS ---
       - ./dataset/big_dataset:/app/dataset/big_dataset
       - ./dataset/minor_dataset:/app/dataset/minor_dataset
+      - ./dataset/doremi:/app/dataset/doremi
+      - ./dataset/barline_yolo:/app/dataset/barline_yolo
       # --- HOT-RELOADING ---
       # Mount source files directly so changes saved locally are reflected
       # inside the container without a full Docker image rebuild.
       - ./app.py:/app/app.py
       - ./core:/app/core
       - ./models:/app/models
+      - ./training:/app/training
 
     deploy:
       resources:
