@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   omr_app:
     build: .
@@ -26,7 +24,10 @@ services:
 
     deploy:
       resources:
+        limits:
+          memory: 12g
         reservations:
+          memory: 6g
           devices:
             - driver: nvidia
               count: 1

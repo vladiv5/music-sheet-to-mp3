@@ -23,6 +23,7 @@ from xml.dom import minidom
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.staff_detector import detect_staff_lines, find_closest_staff, y_to_staff_position, StaffGroup
 from core.primitive_assembler import assemble_primitives
+from core.octave_detector import detect_octave_shifts
 from core.barline_detector import detect_barlines
 
 # ---------------------------------------------------------------------------
@@ -125,11 +126,13 @@ def load_model():
     global _model
     if _model is None:
         from ultralytics import YOLO
-        print(f"[PrimitiveYOLO] 📦 Loading model from: {MODEL_PATH}")
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[PrimitiveYOLO] 📦 Loading model from: {MODEL_PATH} on {device}")
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"[PrimitiveYOLO] ❌ Model file not found: {MODEL_PATH}")
-        _model = YOLO(MODEL_PATH)
-        print("[PrimitiveYOLO] ✅ Model loaded successfully")
+        _model = YOLO(MODEL_PATH).to(device)
+        print(f"[PrimitiveYOLO] ✅ Model loaded successfully on {device}")
     return _model
 
 _barline_model = None
@@ -137,11 +140,13 @@ def load_barline_model():
     global _barline_model
     if _barline_model is None:
         from ultralytics import YOLO
-        print(f"[PrimitiveYOLO] 📦 Loading Barline model from: {BARLINE_MODEL_PATH}")
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[PrimitiveYOLO] 📦 Loading Barline model from: {BARLINE_MODEL_PATH} on {device}")
         if not os.path.exists(BARLINE_MODEL_PATH):
             raise FileNotFoundError(f"[PrimitiveYOLO] ❌ Barline model file not found: {BARLINE_MODEL_PATH}")
-        _barline_model = YOLO(BARLINE_MODEL_PATH)
-        print("[PrimitiveYOLO] ✅ Barline Model loaded successfully")
+        _barline_model = YOLO(BARLINE_MODEL_PATH).to(device)
+        print(f"[PrimitiveYOLO] ✅ Barline Model loaded successfully on {device}")
     return _barline_model
 
 
@@ -151,8 +156,10 @@ def load_barline_model():
 
 def run_detection(image_path: str, conf: float = 0.25, iou: float = 0.7) -> List[Detection]:
     model = load_model()
-    print(f"[PrimitiveYOLO] 🔍 Running inference (conf={conf}, iou={iou}, imgsz=1280)...")
-    results = model.predict(source=image_path, imgsz=1280, conf=conf, iou=iou, verbose=False)
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[PrimitiveYOLO] 🔍 Running inference (conf={conf}, iou={iou}, imgsz=1280, device={device})...")
+    results = model.predict(source=image_path, imgsz=1280, conf=conf, iou=iou, device=device, verbose=False)
 
     detections = []
     for result in results:
@@ -177,7 +184,9 @@ def run_detection(image_path: str, conf: float = 0.25, iou: float = 0.7) -> List
 
 def run_barline_detection(image_path: str, conf: float = 0.5, iou: float = 0.5) -> List[Detection]:
     model = load_barline_model()
-    results = model.predict(source=image_path, imgsz=1280, conf=conf, iou=iou, verbose=False)
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    results = model.predict(source=image_path, imgsz=1280, conf=conf, iou=iou, device=device, verbose=False)
     
     detections = []
     for result in results:
@@ -419,7 +428,7 @@ def apply_rhythm_enforcer(measures: List[List[ChordEvent]], target_beats: float)
         
     return synced_measures
 
-def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup], staff_barlines: Dict[int, List[int]], gray_image: np.ndarray, dx_tolerance: float = 15.0, staves_per_system: int = 1, target_beats: float = 4.0, inherited_fifths: int = None) -> Tuple[Dict[int, List[List[ChordEvent]]], int]:
+def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup], staff_barlines: Dict[int, List[int]], gray_image: np.ndarray, dx_tolerance: float = 15.0, staves_per_system: int = 1, target_beats: float = 4.0, inherited_fifths: int = None, octave_shift: int = 0, octave_shifts: list = None) -> Tuple[Dict[int, List[List[ChordEvent]]], int]:
     
     part_measures: Dict[int, List[List[ChordEvent]]] = {i: [] for i in range(staves_per_system)}
     staff_detections = {id(staff): [] for staff in staffs}
@@ -482,6 +491,13 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
                     duration_type, duration_beats = NOTE_CLASSES[det.class_name]
                     note_y = det.y_center
                     step, octave = map_note_pitch(note_y, [staff], current_clef)
+                    octave += octave_shift
+                    
+                    if octave_shifts:
+                        for shift in octave_shifts:
+                            if shift['staff_id'] == id(staff) and shift['x_start'] <= det.x_center <= shift['x_end']:
+                                octave += shift['amount']
+                                break
                     alter = _find_accidental_for_note(det, group)
                     if alter is None:
                         alter = key_alts.get(step, None)
@@ -495,22 +511,25 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
             staff_chord_events = []
             current_chord = []
             for ev in staff_musical_events:
-                if ev.event_type == 'rest':
-                    if current_chord:
-                        staff_chord_events.append(ChordEvent(current_chord, current_chord[0].duration_beats, current_chord[0].duration_type, len(current_chord)>1))
-                        current_chord = []
-                    staff_chord_events.append(ChordEvent([ev], ev.duration_beats, ev.duration_type, False))
+                if not current_chord:
+                    current_chord.append(ev)
                 else:
-                    if not current_chord:
+                    if abs(ev.x_position - current_chord[0].x_position) <= dx_tolerance:
                         current_chord.append(ev)
                     else:
-                        if abs(ev.x_position - current_chord[0].x_position) <= dx_tolerance:
-                            current_chord.append(ev)
+                        notes_only = [e for e in current_chord if e.event_type == 'note']
+                        if notes_only:
+                            staff_chord_events.append(ChordEvent(notes_only, notes_only[0].duration_beats, notes_only[0].duration_type, len(notes_only)>1))
                         else:
-                            staff_chord_events.append(ChordEvent(current_chord, current_chord[0].duration_beats, current_chord[0].duration_type, len(current_chord)>1))
-                            current_chord = [ev]
+                            staff_chord_events.append(ChordEvent([current_chord[0]], current_chord[0].duration_beats, current_chord[0].duration_type, False))
+                        current_chord = [ev]
+                        
             if current_chord:
-                staff_chord_events.append(ChordEvent(current_chord, current_chord[0].duration_beats, current_chord[0].duration_type, len(current_chord)>1))
+                notes_only = [e for e in current_chord if e.event_type == 'note']
+                if notes_only:
+                    staff_chord_events.append(ChordEvent(notes_only, notes_only[0].duration_beats, notes_only[0].duration_type, len(notes_only)>1))
+                else:
+                    staff_chord_events.append(ChordEvent([current_chord[0]], current_chord[0].duration_beats, current_chord[0].duration_type, False))
 
             sys_unpadded_measures[part_idx] = extract_unpadded_measures_for_staff(staff_chord_events, sys_barlines)
 
@@ -680,8 +699,9 @@ def generation_workflow_primitive_yolo(
     dx_tolerance: float = 15.0, enable_beam_correction: bool = True,
     use_sahi: bool = False, sahi_slice_size: int = 640, sahi_overlap: float = 0.25,
     staves_per_system: int = 1, time_signature: str = "4/4",
-    use_ai_barlines: bool = False, use_measure_sahi: bool = False,
-    inherited_fifths: int = None  # <--- ADĂUGAT AICI
+    use_ai_barlines: bool = False, use_system_sahi: bool = False,
+    inherited_fifths: int = None, sahi_systems_per_slice: int = 1,
+    octave_shift: int = 0
 ):
     os.makedirs(output_dir, exist_ok=True)
     staffs = detect_staff_lines(image_path)
@@ -690,92 +710,103 @@ def generation_workflow_primitive_yolo(
     color_image = cv2.imread(image_path)
     
     interline = 10.0
+    interline = 10.0
     if len(staffs) > 0 and len(staffs[0].line_ys) >= 2:
         interline = staffs[0].line_ys[1] - staffs[0].line_ys[0]
 
-    if use_measure_sahi:
-        # ── SEMANTIC MEASURE-SAHI ──────────────────────────────────────────────────
-        # Step 1: Always use AI barlines to find precise measure boundaries.
-        print("[PrimitiveYOLO] 🎼 Measure-SAHI: Detecting barlines via AI Nano model...")
+    # Detect local octave shifts (8va, 8vb) using OCR
+    print("[PrimitiveYOLO] 🔍 Scanning for local octave shifts (8va/8vb)...")
+    t0_ocr = time.time()
+    octave_shifts = detect_octave_shifts(image_path, staffs, interline)
+    print(f"[PrimitiveYOLO] ⏱️ OCR Octave Detection took {time.time() - t0_ocr:.2f}s")
+    if octave_shifts:
+        print(f"[PrimitiveYOLO] 🎯 Found {len(octave_shifts)} octave shift markers.")
+
+    if use_system_sahi:
+        # ── SYSTEM-SAHI (Grupare pe portative) ──────────────────────────────────
+        print("[PrimitiveYOLO] ✂️  System-SAHI: Slicing by groups of staffs...")
+        
+        # Mai întâi detectăm barlines-urile pentru că avem nevoie de ele mai târziu în pipeline, 
+        # chiar dacă acum nu mai tăiem imaginea după ele!
+        print("[PrimitiveYOLO] 🎼 Detecting barlines via AI Nano model...")
         try:
             staff_barlines = detect_barlines_ai(image_path, staffs, conf=0.15)
         except Exception as e:
             print(f"[PrimitiveYOLO] Warning: AI barline detection failed ({e}). Falling back to OpenCV.")
             staff_barlines = detect_barlines(image_path, staffs, [])
 
-        # Step 2: Crop each measure individually, paste onto canvas, run at training scale.
-        print("[PrimitiveYOLO] ✂️  Measure-SAHI: Slicing and detecting measure by measure...")
         raw_detections = []
-        measure_crop_rects = []   # for diagnostic visualization
+        system_crop_rects = []   # Aici salvăm coordonatele pentru vizualizarea finală
         img_h, img_w = color_image.shape[:2]
         model = load_model()
 
-        # Canvas size matches training resolution — notes will be at the same pixel
-        # scale as during training, preventing hallucinations from scale mismatch.
         CANVAS_SIZE = 1280
+        # Calculăm câte portative (staves) intră într-o felie, bazat pe numărul de sisteme cerut
+        chunk_size = staves_per_system * sahi_systems_per_slice 
 
-        for staff in staffs:
-            bls = [0] + staff_barlines.get(id(staff), []) + [img_w]
-            # Height: staff + generous padding for ledger lines (4.5 interlines each side)
-            pad_y = int(interline * 4.5)
-            y1 = max(0, staff.top - pad_y)
-            y2 = min(img_h, staff.bottom + pad_y)
-            crop_h = y2 - y1
-            if crop_h < 10:
+        # Iterăm prin portative, grupându-le în funcție de setările utilizatorului
+        for i in range(0, len(staffs), chunk_size):
+            group = staffs[i : min(i + chunk_size, len(staffs))]
+            
+            # Tăiem exact la jumătatea distanței dintre sisteme pentru a EVITA SUPRAPUNEREA total!
+            # Astfel, nicio notă nu este procesată de două ori și nu forțăm NMS-ul să facă minuni.
+            if i == 0:
+                y1 = 0
+            else:
+                prev_staff = staffs[i - 1]
+                curr_staff = group[0]
+                y1 = int((prev_staff.bottom + curr_staff.top) / 2)
+                
+            if i + chunk_size >= len(staffs):
+                y2 = img_h
+            else:
+                curr_bottom_staff = group[-1]
+                next_top_staff = staffs[i + chunk_size]
+                y2 = int((curr_bottom_staff.bottom + next_top_staff.top) / 2)
+            
+            if y2 - y1 < 10:
                 continue
 
-            for i in range(len(bls) - 1):
-                x1 = bls[i]
-                x2 = bls[i + 1]
-                crop_w = x2 - x1
-                if crop_w < 10:
-                    continue
+            # Salvăm coordonatele pentru a le desena pe poza de diagnostic la final
+            system_crop_rects.append((0, y1, img_w, y2))
+            
+            # Decupăm felia orizontală (luăm TOATĂ lățimea paginii)
+            slice_crop = color_image[y1:y2, 0:img_w]
+            
+            # Trimitem felia la YOLO. Va face resize păstrând aspect ratio-ul.
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            results = model.predict(
+                source=slice_crop, imgsz=CANVAS_SIZE,
+                conf=conf, iou=iou, device=device, verbose=False
+            )
+            
+            for result in results:
+                boxes = result.boxes
+                names = model.names
+                for k in range(len(boxes)):
+                    cls_id = int(boxes.cls[k].item())
+                    cls_name = names[cls_id] if cls_id in names else f"class_{cls_id}"
+                    x_c_local, y_c_local, w_det, h_det = boxes.xywh[k].tolist()
+                    conf_val = boxes.conf[k].item()
 
-                measure_crop_rects.append((x1, y1, x2, y2))  # record for visualization
-                measure_crop = color_image[y1:y2, x1:x2]
+                    # Transformăm coordonatele Y înapoi la scara paginii globale (X rămâne la fel)
+                    raw_detections.append(Detection(
+                        class_name=cls_name,
+                        x_center=x_c_local,
+                        y_center=y_c_local + y1, # Adăugăm offset-ul feliei
+                        width=w_det, height=h_det,
+                        confidence=conf_val, class_id=cls_id,
+                    ))
 
-                # Paste crop onto a white canvas of CANVAS_SIZE × CANVAS_SIZE.
-                # This preserves the native pixel scale of the notes (matching training),
-                # instead of stretching a tiny crop to fill the inference resolution.
-                canvas = np.full((CANVAS_SIZE, CANVAS_SIZE, 3), 255, dtype=np.uint8)
-                paste_h = min(crop_h, CANVAS_SIZE)
-                paste_w = min(crop_w, CANVAS_SIZE)
-                canvas[0:paste_h, 0:paste_w] = measure_crop[0:paste_h, 0:paste_w]
-
-                results = model.predict(
-                    source=canvas, imgsz=CANVAS_SIZE,
-                    conf=conf, iou=iou, verbose=False
-                )
-                for result in results:
-                    boxes = result.boxes
-                    names = model.names
-                    for k in range(len(boxes)):
-                        cls_id = int(boxes.cls[k].item())
-                        cls_name = names[cls_id] if cls_id in names else f"class_{cls_id}"
-                        x_c_local, y_c_local, w_det, h_det = boxes.xywh[k].tolist()
-                        conf_val = boxes.conf[k].item()
-
-                        # Only keep detections that fall within the actual crop area
-                        # (ignore anything the model found in the white canvas padding)
-                        det_x1 = x_c_local - w_det / 2
-                        det_y1 = y_c_local - h_det / 2
-                        det_x2 = x_c_local + w_det / 2
-                        det_y2 = y_c_local + h_det / 2
-                        if det_x2 < 0 or det_y2 < 0 or det_x1 > paste_w or det_y1 > paste_h:
-                            continue  # completely outside crop — skip
-
-                        # Remap coordinates back to global image space
-                        raw_detections.append(Detection(
-                            class_name=cls_name,
-                            x_center=x_c_local + x1,
-                            y_center=y_c_local + y1,
-                            width=w_det, height=h_det,
-                            confidence=conf_val, class_id=cls_id,
-                        ))
-
-        # I apply my custom musical NMS, passing the dynamic interline distance and the UI iou threshold
+        # Folosim NMS-ul tău muzical pe toate detecțiile la un loc pentru a șterge dublurile
+        # care s-ar fi putut forma la linia de tăietură dintre 2 felii.
         raw_detections = apply_musical_nms(raw_detections, interline, iou_thresh=iou)
-        print(f"[PrimitiveYOLO] 📋 Measure-SAHI: {len(raw_detections)} detections after NMS.")
+        print(f"[PrimitiveYOLO] 📋 System-SAHI: {len(raw_detections)} detections after NMS.")
+        
+        # Facem un truc: redenumim lista noastră ca funcția de desenare să creadă că sunt "măsuri"
+        # și să le deseneze transparent pe imaginea finală din folder.
+        measure_crop_rects = system_crop_rects
 
     elif not use_ai_barlines:
         # ── STANDARD WHOLE-PAGE + OPENCV BARLINES ─────────────────────────────────
@@ -816,7 +847,8 @@ def generation_workflow_primitive_yolo(
     part_measures, fifths = detections_to_measures(
         assembled_detections, staffs, staff_barlines, gray_image, 
         dx_tolerance=dx_tolerance, staves_per_system=staves_per_system, target_beats=target_beats,
-        inherited_fifths=inherited_fifths 
+        inherited_fifths=inherited_fifths, octave_shift=octave_shift,
+        octave_shifts=octave_shifts
     )
     xml_str = events_to_musicxml(part_measures, time_signature=time_signature, fifths=fifths)
     

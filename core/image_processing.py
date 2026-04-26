@@ -1,12 +1,32 @@
 import os
 import subprocess
 import shutil
+import cv2
 
 def generation_workflow_oemer(image_path: str, output_dir: str = "./") -> str:
     """
     I process the music sheet image and generate a MusicXML file using the Oemer Baseline engine.
     I also force the generation of diagnostic images and move everything to the output directory.
+    I implement a safeguard: if the image is too large (> 3000px), I resize it to 2500px to avoid 
+    crashing the RAM.
     """
+    # --- MEMORY SAFEGUARD: IMAGE DOWNSCALING ---
+    img = cv2.imread(image_path)
+    if img is not None:
+        h, w = img.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > 3000:
+            scale = 2500 / max_dim
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            print(f"[Oemer Safeguard] 📏 Resizing large image from {w}x{h} to {new_w}x{new_h}...")
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            
+            # Save downscaled version to a temporary path
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            image_path = os.path.join(output_dir, f"{base_name}_downscaled.png")
+            cv2.imwrite(image_path, img)
+
     # I extract the filename without extension to know what the XML will be called
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     

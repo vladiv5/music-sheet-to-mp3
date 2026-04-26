@@ -100,7 +100,8 @@ def _run_single_engine(engine_name, image_paths, working_dir, conf=0.25, iou=0.7
                        dx_tolerance=15.0, enable_beam_correction=True,
                        use_sahi=False, sahi_slice_size=640, sahi_overlap=0.25,
                        staves_per_system=1, time_signature="4/4", instrument="Acoustic Grand Piano",
-                       use_measure_sahi=False, use_ai_barlines=False, container=None):
+                       use_system_sahi=False, sahi_systems_per_slice=1, use_ai_barlines=False,
+                       octave_shift=0, container=None):
     """
     Run a single AI engine and return a results dict.
     If container is provided, outputs are rendered into that Streamlit container.
@@ -112,11 +113,12 @@ def _run_single_engine(engine_name, image_paths, working_dir, conf=0.25, iou=0.7
 
     t_start = time.perf_counter()
 
-    combined_score = None
+    combined_score = None  # kept for YOLO engines that still use it
+    page_xml_paths = []    # used by Oemer's raw XML merge strategy
     final_xml_path = os.path.join(working_dir, "combined_output.musicxml")
 
     # 1. INIȚIALIZĂM MEMORIA ARMURII AICI:
-    current_fifths = None 
+    current_fifths = None
 
     # Progress bar for pages
     progress_bar = ctx.progress(0.0, text=f"Processing page 1 of {len(image_paths)}...")
@@ -147,31 +149,76 @@ def _run_single_engine(engine_name, image_paths, working_dir, conf=0.25, iou=0.7
                 use_sahi=use_sahi, sahi_slice_size=sahi_slice_size, sahi_overlap=sahi_overlap,
                 staves_per_system=staves_per_system, time_signature=time_signature,
                 use_ai_barlines=use_ai_barlines,
-                use_measure_sahi=use_measure_sahi,
+                use_system_sahi=use_system_sahi,
+                sahi_systems_per_slice=sahi_systems_per_slice,
+                octave_shift=octave_shift,
                 inherited_fifths=current_fifths  # <--- Transmitem memoria de la pagina anterioară!
             )
         else:
             raise ValueError(f"Unknown AI engine: {engine_name}")
 
-        # Stitching logic using music21
-        try:
-            page_score = converter.parse(xml_result)
-            if combined_score is None:
-                combined_score = page_score
-            else:
-                for i, part in enumerate(page_score.parts):
-                    if i < len(combined_score.parts):
-                        for m in part.getElementsByClass('Measure'):
-                            combined_score.parts[i].append(m)
-        except Exception as e:
-            print(f"Failed to stitch page {idx + 1}: {e}")
+        # Collect raw XML paths — we will merge at the XML level to avoid
+        # music21's internal makeRests/makeTies crashing on Oemer's output.
+        page_xml_paths.append(xml_result)
 
     progress_bar.progress(1.0, text="Stitching complete! Synthesizing audio...")
-    
-    if combined_score is not None:
-        combined_score.write('musicxml', fp=final_xml_path)
+
+    # --- XML MERGE STRATEGY ---
+    # If only one page, use the file directly without touching it.
+    # If multiple pages, merge the <measure> blocks at the raw XML level.
+    if len(page_xml_paths) == 1:
+        final_xml_path = page_xml_paths[0]
     else:
-        final_xml_path = xml_result # fallback
+        try:
+            import xml.etree.ElementTree as ET
+            ET.register_namespace('', 'http://www.musicxml.org/ns/mxl')
+
+            # Parse the first page as the base document
+            base_tree = ET.parse(page_xml_paths[0])
+            base_root = base_tree.getroot()
+
+            # Helper: find all <part> elements regardless of namespace
+            def find_parts(root):
+                parts = root.findall('.//{http://www.musicxml.org/ns/mxl}part')
+                if not parts:
+                    parts = root.findall('.//part')
+                return parts
+
+            base_parts = find_parts(base_root)
+
+            # Track the last measure number per part
+            def last_measure_num(part_el):
+                measures = [c for c in part_el if c.tag.endswith('measure') or c.tag == 'measure']
+                if not measures:
+                    return 0
+                num = measures[-1].get('number', '0')
+                try:
+                    return int(num)
+                except ValueError:
+                    return len(measures)
+
+            for extra_xml in page_xml_paths[1:]:
+                extra_tree = ET.parse(extra_xml)
+                extra_root = extra_tree.getroot()
+                extra_parts = find_parts(extra_root)
+
+                for i, base_part in enumerate(base_parts):
+                    if i >= len(extra_parts):
+                        break
+                    offset = last_measure_num(base_part)
+                    extra_part = extra_parts[i]
+                    for measure_el in list(extra_part):
+                        if measure_el.tag.endswith('measure') or measure_el.tag == 'measure':
+                            old_num = int(measure_el.get('number', '1'))
+                            measure_el.set('number', str(offset + old_num))
+                            base_part.append(measure_el)
+
+            base_tree.write(final_xml_path, xml_declaration=True, encoding='UTF-8')
+        except Exception as merge_err:
+            print(f"XML merge failed: {merge_err}, falling back to first page only.")
+            import shutil as _shutil
+            _shutil.copy2(page_xml_paths[0], final_xml_path)
+
 
     t_end = time.perf_counter()
     processing_time = t_end - t_start
@@ -266,19 +313,19 @@ st.sidebar.caption("Fine-tune parameters for Custom YOLO engine.")
 with st.sidebar.expander("🎯 YOLO Detection", expanded=True):
     yolo_conf = st.slider(
         "Confidence Threshold",
-        min_value=0.05, max_value=0.95, value=0.25, step=0.05,
+        min_value=0.05, max_value=0.95, value=0.30, step=0.05,
         help="Lower = more detections (including noise). Higher = only confident detections."
     )
     yolo_iou = st.slider(
         "NMS IoU Threshold",
-        min_value=0.1, max_value=0.9, value=0.7, step=0.1,
+        min_value=0.1, max_value=0.9, value=0.8, step=0.1,
         help="Higher = allows overlapping noteheads (crucial for chords)."
     )
 
 with st.sidebar.expander("🎹 Polyphony & Rhythm", expanded=True):
     yolo_dx = st.slider(
         "Chord Grouping Tolerance (px)",
-        min_value=5.0, max_value=30.0, value=15.0, step=1.0,
+        min_value=5.0, max_value=30.0, value=11.0, step=1.0,
         help="Max X-distance between notes to be grouped as a chord."
     )
     staves_per_system = st.slider(
@@ -297,6 +344,11 @@ with st.sidebar.expander("🎹 Polyphony & Rhythm", expanded=True):
         value=True,
         help="Overrides YOLO's rhythm by analyzing stems for beams/flags (HoughLinesP)."
     )
+    octave_shift = st.slider(
+        "Global Octave Shift",
+        min_value=-2, max_value=2, value=0, step=1,
+        help="Shift the entire sheet music up or down by octaves (e.g., 8va = +1)."
+    )
 
 with st.sidebar.expander("🧠 Smart Auto / SAHI", expanded=True):
     density_threshold = st.slider(
@@ -308,6 +360,16 @@ with st.sidebar.expander("🧠 Smart Auto / SAHI", expanded=True):
         "⚡ Force SAHI (Debug)",
         value=False,
         help="Override Smart Auto: always use SAHI sliced inference regardless of density."
+    )
+    use_system_sahi = st.checkbox(
+        "✂️ Enable System-SAHI",
+        value=False,
+        help="Slices the page horizontally by groups of staves to improve recall on dense sheets."
+    )
+    sahi_systems_per_slice = st.slider(
+        "Systems per SAHI Slice",
+        min_value=1, max_value=4, value=1, step=1,
+        help="How many complete musical systems to group together per horizontal slice."
     )
 with st.sidebar.expander("🛠️ Advanced Settings", expanded=False):
     audio_instrument = st.selectbox(
@@ -340,6 +402,9 @@ if uploaded_file is not None:
             "🔬 Benchmark (Both Models)",
         ]
     )
+    
+    if "Oemer" in selected_model:
+        st.warning("⚠️ **Note on Memory:** Oemer is high-precision but very memory-intensive. I have implemented automatic image downscaling to prevent system crashes, but it may still take several minutes to process.")
 
     if st.button("🚀 Generate Audio", type="primary"):
 
@@ -373,7 +438,9 @@ if uploaded_file is not None:
                 primitive_kwargs = dict(yolo_kwargs)
                 primitive_kwargs["staves_per_system"] = staves_per_system
                 primitive_kwargs["time_signature"] = time_signature
-                primitive_kwargs["use_measure_sahi"] = False  # default off
+                primitive_kwargs["use_system_sahi"] = use_system_sahi
+                primitive_kwargs["sahi_systems_per_slice"] = sahi_systems_per_slice
+                primitive_kwargs["octave_shift"] = octave_shift
 
                 # ===================================================================
                 # MODE 0: Smart Auto — density scorer chooses engine
