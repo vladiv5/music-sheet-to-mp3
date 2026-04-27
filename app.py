@@ -374,7 +374,7 @@ with st.sidebar.expander("🧠 Smart Auto / SAHI", expanded=True):
 with st.sidebar.expander("🛠️ Advanced Settings", expanded=False):
     audio_instrument = st.selectbox(
         "Audio Instrument",
-        ["Acoustic Grand Piano", "Violin", "Flute", "Acoustic Guitar", "Trumpet", "Cello"],
+        ["Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano", "Electric Piano (Rhodes)", "Harpsichord", "Violin", "Flute", "Acoustic Guitar", "Trumpet", "Cello"],
         index=0,
         help="Select the instrument for audio synthesis."
     )

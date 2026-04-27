@@ -20,7 +20,9 @@ from xml.etree.ElementTree import Element, SubElement, ElementTree, tostring
 from xml.dom import minidom
 
 # Ensure the project root is on sys.path so we can import core modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 from core.staff_detector import detect_staff_lines, find_closest_staff, y_to_staff_position, StaffGroup
 from core.primitive_assembler import assemble_primitives
 from core.octave_detector import detect_octave_shifts
@@ -63,6 +65,9 @@ ACCIDENTAL_CLASSES = {
     'accidentalSharp': 'sharp', 
     'accidentalNatural': 'natural'
 }
+
+# Key signature classes detected by YOLO (more reliable than accidentals for key inference)
+KEY_SIG_CLASSES = {'keySharp', 'keyFlat'}
 
 # Treble clef pitch mapping: staff_position → (step, octave)
 TREBLE_PITCH_MAP = {
@@ -358,6 +363,7 @@ def get_key_alterations(fifths: int) -> Dict[str, int]:
     return alterations
 
 def infer_key_signature(staff_detections: List[Detection]) -> int:
+    """Infer key signature from keySharp/keyFlat marks before the first note."""
     first_note_x = float('inf')
     for det in staff_detections:
         if det.class_name in NOTE_CLASSES or det.class_name in REST_CLASSES:
@@ -367,7 +373,13 @@ def infer_key_signature(staff_detections: List[Detection]) -> int:
     flats = 0
     for det in staff_detections:
         if det.x_center < first_note_x:
-            if det.class_name == 'accidentalSharp':
+            # Prefer dedicated key signature classes over accidentals
+            if det.class_name == 'keySharp':
+                sharps += 1
+            elif det.class_name == 'keyFlat':
+                flats += 1
+            # Fallback: also count accidentals in the key signature area
+            elif det.class_name == 'accidentalSharp':
                 sharps += 1
             elif det.class_name == 'accidentalFlat':
                 flats += 1
@@ -397,6 +409,151 @@ def extract_unpadded_measures_for_staff(staff_events: List[ChordEvent], barlines
         measures.append([])
 
     return measures
+
+def detect_repeat_dots(gray_image, staffs, interline, staves_per_system=1):
+    """
+    Detect repeat barline dots using morphological analysis.
+    Repeat dots always appear as two small circles between staff lines 2-3 and 3-4.
+    Returns a list of {'x': int, 'direction': 'forward'|'backward', 'system_idx': int}.
+    """
+    import copy
+    h, w = gray_image.shape
+    _, binary = cv2.threshold(gray_image, 180, 255, cv2.THRESH_BINARY_INV)
+    
+    # Remove horizontal staff lines to isolate symbols
+    horiz_len = max(3, int(interline * 2))
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_len, 1))
+    lines_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
+    no_lines = cv2.subtract(binary, lines_only)
+    
+    contours, _ = cv2.findContours(no_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    results = []
+    
+    for staff_idx, staff in enumerate(staffs):
+        if len(staff.line_ys) < 5:
+            continue
+            
+        system_idx = staff_idx // staves_per_system
+        
+        # Expected y centers for the two dots (between lines 2-3 and 3-4, 0-indexed)
+        dot_y_upper = (staff.line_ys[1] + staff.line_ys[2]) / 2
+        dot_y_lower = (staff.line_ys[2] + staff.line_ys[3]) / 2
+        
+        min_size = max(2, interline * 0.12)
+        max_size = interline * 0.7
+        y_tol = interline * 0.4
+        
+        upper_dots = []
+        lower_dots = []
+        
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            cx, cy = x + cw / 2, y + ch / 2
+            
+            # Size check: dots are small and roughly circular
+            if min_size < cw < max_size and min_size < ch < max_size:
+                aspect = max(cw, ch) / max(min(cw, ch), 1)
+                if aspect < 2.5:
+                    if abs(cy - dot_y_upper) < y_tol:
+                        upper_dots.append(cx)
+                    elif abs(cy - dot_y_lower) < y_tol:
+                        lower_dots.append(cx)
+        
+        # Pair upper and lower dots by x proximity
+        staff_dot_xs = []
+        for ux in upper_dots:
+            for lx in lower_dots:
+                if abs(ux - lx) < interline * 0.8:
+                    pair_x = int((ux + lx) / 2)
+                    if not any(abs(pair_x - ex) < 20 for ex in staff_dot_xs):
+                        staff_dot_xs.append(pair_x)
+                        
+        if not staff_dot_xs:
+            continue
+            
+        y_top, y_bot = staff.line_ys[0], staff.line_ys[-1]
+        
+        for dot_x in sorted(staff_dot_xs):
+            gap = int(interline * 0.4)
+            check = int(interline * 1.5)
+            
+            lx1 = max(0, dot_x - check)
+            lx2 = max(0, dot_x - gap)
+            rx1 = min(w, dot_x + gap)
+            rx2 = min(w, dot_x + check)
+            
+            left_ink = np.sum(binary[y_top:y_bot, lx1:lx2]) / 255 if lx2 > lx1 else 0
+            right_ink = np.sum(binary[y_top:y_bot, rx1:rx2]) / 255 if rx2 > rx1 else 0
+            
+            if left_ink > right_ink * 1.2:
+                direction = 'forward'
+            elif right_ink > left_ink * 1.2:
+                direction = 'backward'
+            else:
+                direction = 'forward' if dot_x < w * 0.4 else 'backward'
+            
+            # Avoid duplicates across staves of the same system
+            if not any(abs(r['x'] - dot_x) < 20 and r['system_idx'] == system_idx for r in results):
+                results.append({'x': dot_x, 'direction': direction, 'system_idx': system_idx})
+                print(f"[RepeatDetector] 🔁 Repeat dots at x={dot_x}, direction={direction}, system={system_idx}")
+    
+    return results
+
+
+def apply_repeats(part_measures, repeat_info, measure_x_ranges):
+    """
+    Duplicate measures based on repeat dot positions.
+    Works at the data level (not XML) to avoid music21 issues.
+    
+    measure_x_ranges: list of {'system_idx': int, 'lx': float, 'rx': float} for each global measure index.
+    """
+    import copy
+    if not repeat_info or not measure_x_ranges:
+        return part_measures
+    
+    def get_measure_idx(x, system_idx):
+        for i, m_info in enumerate(measure_x_ranges):
+            if m_info['system_idx'] == system_idx and m_info['lx'] <= x < m_info['rx']:
+                return i
+        # Fallback to nearest in the same system
+        system_measures = [i for i, m in enumerate(measure_x_ranges) if m['system_idx'] == system_idx]
+        if not system_measures:
+            return len(measure_x_ranges) - 1
+        if x < measure_x_ranges[system_measures[0]]['lx']:
+            return system_measures[0]
+        return system_measures[-1]
+    
+    forwards = sorted([r for r in repeat_info if r['direction'] == 'forward'], key=lambda r: (r['system_idx'], r['x']))
+    backwards = sorted([r for r in repeat_info if r['direction'] == 'backward'], key=lambda r: (r['system_idx'], r['x']))
+    
+    # Build repeat ranges: each backward repeat pairs with the nearest preceding forward
+    repeat_ranges = []
+    for bw in backwards:
+        bw_idx = get_measure_idx(bw['x'], bw['system_idx'])
+        fw_idx = 0  # Default: repeat from the beginning
+        for fw in forwards:
+            # A forward repeat is before this backward repeat if it's on an earlier system OR (same system and smaller x)
+            if fw['system_idx'] < bw['system_idx'] or (fw['system_idx'] == bw['system_idx'] and fw['x'] < bw['x']):
+                fw_idx = get_measure_idx(fw['x'], fw['system_idx'])
+        repeat_ranges.append((fw_idx, bw_idx))
+    
+    if not repeat_ranges:
+        return part_measures
+    
+    print(f"[RepeatDetector] 🔄 Applying {len(repeat_ranges)} repeat range(s): {repeat_ranges}")
+    
+    # Apply repeats from last to first to preserve indices
+    for start, end in sorted(repeat_ranges, reverse=True):
+        for p_idx in part_measures:
+            measures = part_measures[p_idx]
+            if end < len(measures):
+                repeated = copy.deepcopy(measures[start:end + 1])
+                # Insert the repeated section right after the original
+                for i, m in enumerate(repeated):
+                    measures.insert(end + 1 + i, m)
+    
+    return part_measures
 
 def apply_rhythm_enforcer(measures: List[List[ChordEvent]], target_beats: float) -> List[List[ChordEvent]]:
     synced_measures = []
@@ -428,9 +585,10 @@ def apply_rhythm_enforcer(measures: List[List[ChordEvent]], target_beats: float)
         
     return synced_measures
 
-def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup], staff_barlines: Dict[int, List[int]], gray_image: np.ndarray, dx_tolerance: float = 15.0, staves_per_system: int = 1, target_beats: float = 4.0, inherited_fifths: int = None, octave_shift: int = 0, octave_shifts: list = None) -> Tuple[Dict[int, List[List[ChordEvent]]], int]:
+def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup], staff_barlines: Dict[int, List[int]], gray_image: np.ndarray, dx_tolerance: float = 15.0, staves_per_system: int = 1, target_beats: float = 4.0, inherited_fifths: int = None, octave_shift: int = 0, octave_shifts: list = None) -> Tuple[Dict[int, List[List[ChordEvent]]], int, List[dict]]:
     
     part_measures: Dict[int, List[List[ChordEvent]]] = {i: [] for i in range(staves_per_system)}
+    global_measure_x_ranges = []
     staff_detections = {id(staff): [] for staff in staffs}
     orphaned_detections = []
     
@@ -440,6 +598,15 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
             staff_detections[id(staff)].append(det)
         else:
             orphaned_detections.append(det)
+
+    # Calculate average notehead height per staff for grace note detection
+    staff_avg_note_height = {}
+    for staff_id, dets in staff_detections.items():
+        noteheads = [d for d in dets if d.class_name == 'noteheadBlack']
+        if noteheads:
+            staff_avg_note_height[staff_id] = sum(d.height for d in noteheads) / len(noteheads)
+        else:
+            staff_avg_note_height[staff_id] = 20
 
     if orphaned_detections and not staffs:
         staff_detections['fallback'] = orphaned_detections
@@ -466,6 +633,7 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
     key_alts = get_key_alterations(global_fifths)
     
     for sys_idx in range(0, len(staffs), staves_per_system):
+        system_idx = sys_idx // staves_per_system
         system_staffs = staffs[sys_idx : min(sys_idx + staves_per_system, len(staffs))]
         sys_barlines = staff_barlines.get(id(system_staffs[0]), [])
         
@@ -486,8 +654,17 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
 
                 if det.class_name in ACCIDENTAL_CLASSES:
                     continue
+                
+                # Skip key signature marks (already processed in infer_key_signature)
+                if det.class_name in KEY_SIG_CLASSES:
+                    continue
 
                 if det.class_name in NOTE_CLASSES:
+                    # Grace note detection: if notehead is significantly smaller than average, skip it
+                    avg_h = staff_avg_note_height.get(id(staff), 20)
+                    if det.height < avg_h * 0.75:
+                        continue  # Ignore grace notes entirely to prevent rhythm desync
+                    
                     duration_type, duration_beats = NOTE_CLASSES[det.class_name]
                     note_y = det.y_center
                     step, octave = map_note_pitch(note_y, [staff], current_clef)
@@ -544,6 +721,14 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
             if not is_empty:
                 valid_intervals.append(i)
                 
+        sys_bounds = [0] + sys_barlines + [gray_image.shape[1] if gray_image is not None else float('inf')]
+        for i in valid_intervals:
+            global_measure_x_ranges.append({
+                'system_idx': system_idx,
+                'lx': sys_bounds[i],
+                'rx': sys_bounds[i+1]
+            })
+
         for p_idx in range(staves_per_system):
             if p_idx not in sys_unpadded_measures: continue
             
@@ -557,7 +742,7 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
             synced_m = apply_rhythm_enforcer(valid_m, target_beats)
             part_measures[p_idx].extend(synced_m)
 
-    return part_measures, global_fifths
+    return part_measures, global_fifths, global_measure_x_ranges
 
 def events_to_musicxml(part_measures: Dict[int, List[List[ChordEvent]]], time_signature: str = "4/4", title: str = "Primitive YOLO Detection", fifths: int = 0) -> str:
     divisions = 4
@@ -844,12 +1029,18 @@ def generation_workflow_primitive_yolo(
     target_beats = float(tb_num) * (4.0 / tb_den)
     
     # --- AICI TRANSMITEM parametrul mai departe ---
-    part_measures, fifths = detections_to_measures(
+    part_measures, fifths, measure_x_ranges = detections_to_measures(
         assembled_detections, staffs, staff_barlines, gray_image, 
         dx_tolerance=dx_tolerance, staves_per_system=staves_per_system, target_beats=target_beats,
         inherited_fifths=inherited_fifths, octave_shift=octave_shift,
         octave_shifts=octave_shifts
     )
+    
+    # 🔁 Detect and apply repeats 🔁
+    print("[PrimitiveYOLO] 🔁 Detecting repeat barlines...")
+    repeat_info = detect_repeat_dots(gray_image, staffs, interline, staves_per_system)
+    part_measures = apply_repeats(part_measures, repeat_info, measure_x_ranges)
+    
     xml_str = events_to_musicxml(part_measures, time_signature=time_signature, fifths=fifths)
     
     xml_path = os.path.join(output_dir, f"output_{os.path.basename(image_path)}.musicxml")
