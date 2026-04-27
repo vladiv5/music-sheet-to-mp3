@@ -101,7 +101,8 @@ def _run_single_engine(engine_name, image_paths, working_dir, conf=0.25, iou=0.7
                        use_sahi=False, sahi_slice_size=640, sahi_overlap=0.25,
                        staves_per_system=1, time_signature="4/4", instrument="Acoustic Grand Piano",
                        use_system_sahi=False, sahi_systems_per_slice=1, use_ai_barlines=False,
-                       octave_shift=0, container=None):
+                       octave_shift=0, enable_ties=False, enable_volta=True,
+                       container=None):
     """
     Run a single AI engine and return a results dict.
     If container is provided, outputs are rendered into that Streamlit container.
@@ -152,6 +153,8 @@ def _run_single_engine(engine_name, image_paths, working_dir, conf=0.25, iou=0.7
                 use_system_sahi=use_system_sahi,
                 sahi_systems_per_slice=sahi_systems_per_slice,
                 octave_shift=octave_shift,
+                enable_ties=enable_ties,
+                enable_volta=enable_volta,
                 inherited_fifths=current_fifths  # <--- Transmitem memoria de la pagina anterioară!
             )
         else:
@@ -350,6 +353,21 @@ with st.sidebar.expander("🎹 Polyphony & Rhythm", expanded=True):
         help="Shift the entire sheet music up or down by octaves (e.g., 8va = +1)."
     )
 
+with st.sidebar.expander("🔗 Ties, Slurs & Repeats", expanded=True):
+    enable_ties = st.checkbox(
+        "🔗 Enable Tie/Slur Detection",
+        value=False,
+        help="Detect curved arcs between same-pitch notes and merge their durations "
+             "(note is held, not re-struck). Recommended for Clair de Lune and Romantic scores. "
+             "Uses OpenCV morphology — no model retraining required."
+    )
+    enable_volta = st.checkbox(
+        "🎼 Enable Volta Bracket Detection",
+        value=True,
+        help="Detect '1.' and '2.' ending brackets and apply them correctly during repeats: "
+             "first pass plays volta 1, second pass plays volta 2. Uses OCR (pytesseract)."
+    )
+
 with st.sidebar.expander("🧠 Smart Auto / SAHI", expanded=True):
     density_threshold = st.slider(
         "Density Threshold",
@@ -441,6 +459,8 @@ if uploaded_file is not None:
                 primitive_kwargs["use_system_sahi"] = use_system_sahi
                 primitive_kwargs["sahi_systems_per_slice"] = sahi_systems_per_slice
                 primitive_kwargs["octave_shift"] = octave_shift
+                primitive_kwargs["enable_ties"] = enable_ties
+                primitive_kwargs["enable_volta"] = enable_volta
 
                 # ===================================================================
                 # MODE 0: Smart Auto — density scorer chooses engine

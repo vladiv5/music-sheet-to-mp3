@@ -27,6 +27,8 @@ from core.staff_detector import detect_staff_lines, find_closest_staff, y_to_sta
 from core.primitive_assembler import assemble_primitives
 from core.octave_detector import detect_octave_shifts
 from core.barline_detector import detect_barlines
+from core.tie_detector import detect_ties, arcs_for_staff, is_covered_by_arc
+from core.volta_detector import detect_voltas
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -505,55 +507,167 @@ def apply_repeats(part_measures, repeat_info, measure_x_ranges):
     """
     Duplicate measures based on repeat dot positions.
     Works at the data level (not XML) to avoid music21 issues.
-    
+
     measure_x_ranges: list of {'system_idx': int, 'lx': float, 'rx': float} for each global measure index.
+    """
+    return apply_repeats_with_volta(part_measures, repeat_info, measure_x_ranges, voltas=[])
+
+
+def apply_repeats_with_volta(part_measures, repeat_info, measure_x_ranges, voltas=None):
+    """
+    Duplicate measures based on repeat dot positions, honouring volta brackets.
+
+    Volta logic:
+      - A volta '1.' bracket covers a range of measures that are played ONLY
+        on the FIRST pass through a repeat.
+      - A volta '2.' bracket covers measures played on the SECOND pass
+        (replacing the '1.' measures).
+
+    If no volta brackets are detected the behaviour is identical to the
+    original apply_repeats().
+
+    measure_x_ranges: list of {'system_idx': int, 'lx': float, 'rx': float}
+    voltas:           list of {'staff_id': int, 'x_start': float,
+                               'x_end': float, 'number': int}
     """
     import copy
     if not repeat_info or not measure_x_ranges:
         return part_measures
-    
+
+    voltas = voltas or []
+
+    # ── Helper: x-position → global measure index ─────────────────────────
     def get_measure_idx(x, system_idx):
         for i, m_info in enumerate(measure_x_ranges):
             if m_info['system_idx'] == system_idx and m_info['lx'] <= x < m_info['rx']:
                 return i
-        # Fallback to nearest in the same system
-        system_measures = [i for i, m in enumerate(measure_x_ranges) if m['system_idx'] == system_idx]
+        system_measures = [
+            i for i, m in enumerate(measure_x_ranges)
+            if m['system_idx'] == system_idx
+        ]
         if not system_measures:
             return len(measure_x_ranges) - 1
         if x < measure_x_ranges[system_measures[0]]['lx']:
             return system_measures[0]
         return system_measures[-1]
-    
-    forwards = sorted([r for r in repeat_info if r['direction'] == 'forward'], key=lambda r: (r['system_idx'], r['x']))
-    backwards = sorted([r for r in repeat_info if r['direction'] == 'backward'], key=lambda r: (r['system_idx'], r['x']))
-    
-    # Build repeat ranges: each backward repeat pairs with the nearest preceding forward
+
+    # ── Helper: find which global measure index an x falls in ─────────────
+    def x_to_measure(x):
+        for i, m_info in enumerate(measure_x_ranges):
+            if m_info['lx'] <= x < m_info['rx']:
+                return i
+        return None
+
+    forwards  = sorted(
+        [r for r in repeat_info if r['direction'] == 'forward'],
+        key=lambda r: (r['system_idx'], r['x'])
+    )
+    backwards = sorted(
+        [r for r in repeat_info if r['direction'] == 'backward'],
+        key=lambda r: (r['system_idx'], r['x'])
+    )
+
+    # ── Build (start_idx, end_idx) pairs ─────────────────────────────────
     repeat_ranges = []
     for bw in backwards:
         bw_idx = get_measure_idx(bw['x'], bw['system_idx'])
-        fw_idx = 0  # Default: repeat from the beginning
+        fw_idx = 0
         for fw in forwards:
-            # A forward repeat is before this backward repeat if it's on an earlier system OR (same system and smaller x)
-            if fw['system_idx'] < bw['system_idx'] or (fw['system_idx'] == bw['system_idx'] and fw['x'] < bw['x']):
+            if (fw['system_idx'] < bw['system_idx'] or
+                    (fw['system_idx'] == bw['system_idx'] and fw['x'] < bw['x'])):
                 fw_idx = get_measure_idx(fw['x'], fw['system_idx'])
         repeat_ranges.append((fw_idx, bw_idx))
-    
+
     if not repeat_ranges:
         return part_measures
-    
-    print(f"[RepeatDetector] 🔄 Applying {len(repeat_ranges)} repeat range(s): {repeat_ranges}")
-    
-    # Apply repeats from last to first to preserve indices
+
+    print(f"[RepeatDetector] Applying {len(repeat_ranges)} repeat range(s): {repeat_ranges}")
+    if voltas:
+        print(f"[VoltaDetector] Applying {len(voltas)} volta bracket(s).")
+
+    # ── Determine volta measure ranges ────────────────────────────────────
+    # volta_ranges: list of {'number': int, 'start': int, 'end': int}
+    volta_ranges = []
+    for v in voltas:
+        v_start = x_to_measure(v['x_start'])
+        v_end   = x_to_measure(v['x_end'])
+        if v_start is None or v_end is None:
+            continue
+        volta_ranges.append({'number': v['number'], 'start': v_start, 'end': v_end})
+
+    def get_volta_range(number):
+        """Return (start, end) measure indices for a given volta number, or None."""
+        for vr in volta_ranges:
+            if vr['number'] == number:
+                return vr['start'], vr['end']
+        return None
+
+    # ── Apply repeats from last to first to preserve indices ──────────────
     for start, end in sorted(repeat_ranges, reverse=True):
-        for p_idx in part_measures:
-            measures = part_measures[p_idx]
-            if end < len(measures):
-                repeated = copy.deepcopy(measures[start:end + 1])
-                # Insert the repeated section right after the original
-                for i, m in enumerate(repeated):
-                    measures.insert(end + 1 + i, m)
-    
+        # Check if volta brackets exist for this repeat range
+        v1 = get_volta_range(1)
+        v2 = get_volta_range(2)
+
+        if v1 and v2:
+            # ── Volta logic ──────────────────────────────────────────────
+            # v1 = (v1_start, v1_end) → played ONLY on first pass
+            # v2 = (v2_start, v2_end) → played ONLY on second pass
+            v1_start, v1_end = v1
+            v2_start, v2_end = v2
+
+            for p_idx in part_measures:
+                measures = part_measures[p_idx]
+                if end >= len(measures):
+                    continue
+
+                # First pass: start..v1_end  (includes volta 1, excludes volta 2)
+                first_pass = copy.deepcopy(measures[start:v1_end + 1])
+                # Second pass: start..v1_start-1 then v2_start..v2_end
+                second_pass = (
+                    copy.deepcopy(measures[start:v1_start]) +
+                    copy.deepcopy(measures[v2_start:v2_end + 1])
+                )
+
+                # Replace the original section (start to v2_end) with the expanded version
+                measures[start:v2_end + 1] = first_pass + second_pass
+
+                print(f"[VoltaDetector] Part {p_idx}: "
+                      f"First pass m{start}-{v1_end}, "
+                      f"Second pass m{start}-{v1_start-1} + m{v2_start}-{v2_end}")
+        else:
+            # ── Standard repeat (no volta) ───────────────────────────────
+            for p_idx in part_measures:
+                measures = part_measures[p_idx]
+                if end < len(measures):
+                    repeated = copy.deepcopy(measures[start:end + 1])
+                    for i, m in enumerate(repeated):
+                        measures.insert(end + 1 + i, m)
+
     return part_measures
+
+def beats_to_duration_type(beats: float) -> tuple:
+    """
+    Convert a beat value to (duration_type, is_dotted).
+    Uses a lookup table covering whole, half, quarter, eighth, 16th and
+    their dotted variants.  Returns ('quarter', False) as safe fallback.
+    """
+    TABLE = [
+        (4.0,  'whole',   False),
+        (3.0,  'half',    True ),  # dotted half
+        (2.0,  'half',    False),
+        (1.5,  'quarter', True ),  # dotted quarter
+        (1.0,  'quarter', False),
+        (0.75, 'eighth',  True ),  # dotted eighth
+        (0.5,  'eighth',  False),
+        (0.25, '16th',    False),
+    ]
+    for val, dtype, dotted in TABLE:
+        if abs(beats - val) < 0.01:
+            return dtype, dotted
+    # Best-effort: find closest entry
+    closest = min(TABLE, key=lambda row: abs(beats - row[0]))
+    return closest[1], closest[2]
+
 
 def apply_rhythm_enforcer(measures: List[List[ChordEvent]], target_beats: float) -> List[List[ChordEvent]]:
     synced_measures = []
@@ -561,11 +675,7 @@ def apply_rhythm_enforcer(measures: List[List[ChordEvent]], target_beats: float)
         total_beats = sum(ev.duration_beats for ev in m)
         if total_beats < target_beats - 0.01:
             diff = target_beats - total_beats
-            duration_type = 'quarter'
-            if diff == 0.5: duration_type = 'eighth'
-            elif diff == 0.25: duration_type = '16th'
-            elif diff == 2.0: duration_type = 'half'
-            elif diff >= 4.0: duration_type = 'whole'
+            duration_type, _ = beats_to_duration_type(diff)
             m.append(ChordEvent([MusicalEvent('rest', duration_type, diff, x_position=0.0)], diff, duration_type, False))
         elif total_beats > target_beats + 0.01:
             accum = 0.0
@@ -577,15 +687,93 @@ def apply_rhythm_enforcer(measures: List[List[ChordEvent]], target_beats: float)
                 else:
                     remaining = target_beats - accum
                     if remaining > 0.01:
+                        # ── FIX: update both duration_beats AND duration_type ──
+                        clipped_type, _ = beats_to_duration_type(remaining)
                         ev.duration_beats = remaining
+                        ev.duration_type  = clipped_type
                         clipped_m.append(ev)
                     break
             m = clipped_m
         synced_measures.append(m)
-        
+
     return synced_measures
 
-def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup], staff_barlines: Dict[int, List[int]], gray_image: np.ndarray, dx_tolerance: float = 15.0, staves_per_system: int = 1, target_beats: float = 4.0, inherited_fifths: int = None, octave_shift: int = 0, octave_shifts: list = None) -> Tuple[Dict[int, List[List[ChordEvent]]], int, List[dict]]:
+
+def resolve_ties(
+    staff_chord_events: List[ChordEvent],
+    staff_arcs: List[dict],
+) -> List[ChordEvent]:
+    """
+    Merge consecutive ChordEvents that are connected by a detected tie arc.
+
+    Rules:
+      - Both events must be non-rest notes.
+      - They must share at least one pitch (same step + octave).
+      - There must be an arc whose horizontal span covers the gap between them.
+
+    When a tie is detected:
+      - The tied notes of the SECOND chord are removed (not re-struck).
+      - The FIRST chord's duration is extended by the second chord's duration.
+      - If the second chord had other notes not tied, they become a separate
+        chord at the same position (not yet implemented — conservative: skip
+        merge if chords have different sizes).
+    """
+    if not staff_arcs or not staff_chord_events:
+        return staff_chord_events
+
+    result: List[ChordEvent] = []
+    skip_next = False
+
+    for i, ev in enumerate(staff_chord_events):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if i + 1 >= len(staff_chord_events):
+            result.append(ev)
+            continue
+
+        next_ev = staff_chord_events[i + 1]
+
+        # Both must be notes (not rests)
+        ev_notes   = [n for n in ev.notes   if n.event_type == 'note']
+        next_notes = [n for n in next_ev.notes if n.event_type == 'note']
+        if not ev_notes or not next_notes:
+            result.append(ev)
+            continue
+
+        # Check pitch overlap
+        ev_pitches   = {(n.step, n.octave) for n in ev_notes}
+        next_pitches = {(n.step, n.octave) for n in next_notes}
+        shared = ev_pitches & next_pitches
+        if not shared:
+            result.append(ev)
+            continue
+
+        # Check arc coverage
+        x_prev = ev.notes[0].x_position
+        x_curr = next_ev.notes[0].x_position
+        if not is_covered_by_arc(x_prev, x_curr, staff_arcs):
+            result.append(ev)
+            continue
+
+        # ── Merge: extend ev's duration, drop next_ev ────────────────────────
+        merged_beats = ev.duration_beats + next_ev.duration_beats
+        merged_type, _  = beats_to_duration_type(merged_beats)
+        merged_ev = ChordEvent(
+            notes          = ev.notes,
+            duration_beats = merged_beats,
+            duration_type  = merged_type,
+            is_chord       = ev.is_chord,
+        )
+        print(f"[TieDetector] [TIE] Merged: {list(shared)} "
+              f"{ev.duration_beats}+{next_ev.duration_beats}->{merged_beats} beats")
+        result.append(merged_ev)
+        skip_next = True
+
+    return result
+
+def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup], staff_barlines: Dict[int, List[int]], gray_image: np.ndarray, dx_tolerance: float = 15.0, staves_per_system: int = 1, target_beats: float = 4.0, inherited_fifths: int = None, octave_shift: int = 0, octave_shifts: list = None, tie_arcs: list = None) -> Tuple[Dict[int, List[List[ChordEvent]]], int, List[dict]]:
     
     part_measures: Dict[int, List[List[ChordEvent]]] = {i: [] for i in range(staves_per_system)}
     global_measure_x_ranges = []
@@ -708,6 +896,11 @@ def detections_to_measures(detections: List[Detection], staffs: List[StaffGroup]
                 else:
                     staff_chord_events.append(ChordEvent([current_chord[0]], current_chord[0].duration_beats, current_chord[0].duration_type, False))
 
+            # ── Tie resolution (before barline splitting) ──────────────────────
+            if tie_arcs is not None:
+                staff_specific_arcs = arcs_for_staff(tie_arcs, id(staff))
+                staff_chord_events = resolve_ties(staff_chord_events, staff_specific_arcs)
+
             sys_unpadded_measures[part_idx] = extract_unpadded_measures_for_staff(staff_chord_events, sys_barlines)
 
         num_intervals = len(sys_barlines) + 1
@@ -782,11 +975,16 @@ def events_to_musicxml(part_measures: Dict[int, List[List[ChordEvent]]], time_si
                     SubElement(clef, 'line').text = '2'
 
             for chord_event in measure_events:
+                # Determine correct duration_type and dot flag from actual beats
+                dtype_corrected, is_dotted = beats_to_duration_type(chord_event.duration_beats)
+
                 note_elem = SubElement(measure, 'note')
                 if chord_event.notes[0].event_type == 'rest':
                     SubElement(note_elem, 'rest')
                     SubElement(note_elem, 'duration').text = str(beats_to_duration(chord_event.duration_beats))
-                    SubElement(note_elem, 'type').text = chord_event.duration_type
+                    SubElement(note_elem, 'type').text = dtype_corrected
+                    if is_dotted:
+                        SubElement(note_elem, 'dot')
                 else:
                     for note_idx, event in enumerate(chord_event.notes):
                         if note_idx > 0:
@@ -798,8 +996,8 @@ def events_to_musicxml(part_measures: Dict[int, List[List[ChordEvent]]], time_si
                             SubElement(pitch, 'alter').text = str(event.alter)
                         SubElement(pitch, 'octave').text = str(event.octave)
                         SubElement(note_elem, 'duration').text = str(beats_to_duration(chord_event.duration_beats))
-                        SubElement(note_elem, 'type').text = chord_event.duration_type
-                        if chord_event.duration_type in ('half', 'quarter') and chord_event.duration_beats in (3, 1.5):
+                        SubElement(note_elem, 'type').text = dtype_corrected
+                        if is_dotted:
                             SubElement(note_elem, 'dot')
                         if event.alter is not None:
                             acc_elem = SubElement(note_elem, 'accidental')
@@ -886,7 +1084,9 @@ def generation_workflow_primitive_yolo(
     staves_per_system: int = 1, time_signature: str = "4/4",
     use_ai_barlines: bool = False, use_system_sahi: bool = False,
     inherited_fifths: int = None, sahi_systems_per_slice: int = 1,
-    octave_shift: int = 0
+    octave_shift: int = 0,
+    enable_ties: bool = False,
+    enable_volta: bool = True,
 ):
     os.makedirs(output_dir, exist_ok=True)
     staffs = detect_staff_lines(image_path)
@@ -1028,18 +1228,37 @@ def generation_workflow_primitive_yolo(
     tb_num, tb_den = map(int, time_signature.split('/'))
     target_beats = float(tb_num) * (4.0 / tb_den)
     
+    # ── Tie / slur detection ─────────────────────────────────────────────────
+    tie_arcs = None
+    if enable_ties:
+        print("[PrimitiveYOLO] [TIE] Detecting ties/slurs...")
+        t0_tie = time.time()
+        tie_arcs = detect_ties(gray_image, staffs, interline)
+        print(f"[PrimitiveYOLO] [TIE] Detection took {time.time() - t0_tie:.2f}s")
+
     # --- AICI TRANSMITEM parametrul mai departe ---
     part_measures, fifths, measure_x_ranges = detections_to_measures(
-        assembled_detections, staffs, staff_barlines, gray_image, 
+        assembled_detections, staffs, staff_barlines, gray_image,
         dx_tolerance=dx_tolerance, staves_per_system=staves_per_system, target_beats=target_beats,
         inherited_fifths=inherited_fifths, octave_shift=octave_shift,
-        octave_shifts=octave_shifts
+        octave_shifts=octave_shifts,
+        tie_arcs=tie_arcs,
     )
-    
-    # 🔁 Detect and apply repeats 🔁
+
+    # 🔁 Detect repeat barlines 🔁
     print("[PrimitiveYOLO] 🔁 Detecting repeat barlines...")
     repeat_info = detect_repeat_dots(gray_image, staffs, interline, staves_per_system)
-    part_measures = apply_repeats(part_measures, repeat_info, measure_x_ranges)
+
+    # 🎼 Detect volta brackets (1. / 2.) ──────────────────────────────────────
+    voltas = []
+    if enable_volta:
+        print("[PrimitiveYOLO] [VOLTA] Detecting volta brackets...")
+        try:
+            voltas = detect_voltas(image_path, staffs)
+        except Exception as e_volta:
+            print(f"[PrimitiveYOLO] [VOLTA] Detection skipped: {e_volta}")
+
+    part_measures = apply_repeats_with_volta(part_measures, repeat_info, measure_x_ranges, voltas=voltas)
     
     xml_str = events_to_musicxml(part_measures, time_signature=time_signature, fifths=fifths)
     
